@@ -1,0 +1,333 @@
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import {
+  X,
+  Wifi,
+  WifiOff,
+  Camera,
+  Copy,
+  Clipboard,
+  Check,
+  AlertCircle,
+  Trash2,
+  Glasses,
+} from 'lucide-react';
+import {
+  loadConnectionConfig,
+  saveConnectionConfig,
+  clearConnectionConfig,
+  ConnectionConfig,
+} from '../services/ConnectionConfig';
+import { QRScanner } from './QRScanner';
+import { G2RuntimeState } from '../hud/g2-runtime';
+
+interface SettingsModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onReconnect: () => void;
+  isBridgeAvailable: boolean;
+  g2RuntimeState: G2RuntimeState;
+  onStartG2Runtime: () => void;
+  onStopG2Runtime: () => void;
+}
+
+export const SettingsModal: React.FC<SettingsModalProps> = ({
+  isOpen,
+  onClose,
+  onReconnect,
+  isBridgeAvailable,
+  g2RuntimeState,
+  onStartG2Runtime,
+  onStopG2Runtime,
+}) => {
+  const [config, setConfig] = useState<ConnectionConfig | null>(null);
+  const [showQRScanner, setShowQRScanner] = useState<boolean>(false);
+  const [pasteText, setPasteText] = useState<string>('');
+  const [error, setError] = useState<string>('');
+  const [copied, setCopied] = useState<boolean>(false);
+  const [connected, setConnected] = useState<boolean>(false);
+  const pasteInputRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      const saved = loadConnectionConfig();
+      setConfig(saved);
+      setConnected(saved !== null);
+      setError('');
+      setPasteText('');
+      setCopied(false);
+      setShowQRScanner(false);
+    }
+  }, [isOpen]);
+
+  const handleQRScan = useCallback((data: string) => {
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed.type !== 'homepilot-connection') {
+        setError('HomePilotの接続情報ではありません。');
+        return;
+      }
+      if (parsed.version !== 1) {
+        setError('対応していない接続情報バージョンです。');
+        return;
+      }
+      if (!parsed.url || !parsed.token) {
+        setError('接続情報の形式が正しくありません。');
+        return;
+      }
+
+      const newConfig: ConnectionConfig = {
+        type: 'homepilot-connection',
+        version: 1,
+        url: parsed.url,
+        token: parsed.token,
+      };
+      saveConnectionConfig(newConfig);
+      setConfig(newConfig);
+      setConnected(true);
+      setShowQRScanner(false);
+      setError('');
+      onReconnect();
+    } catch {
+      setError('QRコードを読み取れませんでした。');
+    }
+  }, [onReconnect]);
+
+  const handlePaste = useCallback(() => {
+    try {
+      const parsed = JSON.parse(pasteText);
+      if (parsed.type !== 'homepilot-connection') {
+        setError('HomePilotの接続情報ではありません。');
+        return;
+      }
+      if (parsed.version !== 1) {
+        setError('対応していない接続情報バージョンです。');
+        return;
+      }
+      if (!parsed.url || !parsed.token) {
+        setError('接続情報の形式が正しくありません。');
+        return;
+      }
+
+      const newConfig: ConnectionConfig = {
+        type: 'homepilot-connection',
+        version: 1,
+        url: parsed.url,
+        token: parsed.token,
+      };
+      saveConnectionConfig(newConfig);
+      setConfig(newConfig);
+      setConnected(true);
+      setPasteText('');
+      setError('');
+      onReconnect();
+    } catch {
+      setError('接続情報の形式が正しくありません。');
+    }
+  }, [pasteText, onReconnect]);
+
+  const handleCopyConnectionInfo = useCallback(async () => {
+    if (!config) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(config));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setError('コピーに失敗しました。');
+    }
+  }, [config]);
+
+  const handleClearConnection = useCallback(() => {
+    clearConnectionConfig();
+    setConfig(null);
+    setConnected(false);
+    onReconnect();
+  }, [onReconnect]);
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="settings-overlay" onClick={onClose}>
+      <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="settings-header">
+          <h2>HomePilot Settings</h2>
+          <button className="settings-close" onClick={onClose}>
+            <X size={20} />
+          </button>
+        </div>
+
+        <div className="settings-body">
+
+          {/* G2 Connection */}
+          <section className="settings-section">
+            <h3>接続情報</h3>
+
+            <div className="paste-section">
+              <p className="settings-description">
+                接続情報を貼り付け
+              </p>
+              <textarea
+                ref={pasteInputRef}
+                className="paste-input"
+                placeholder='{"type":"homepilot-connection",...}'
+                value={pasteText}
+                onChange={(e) => setPasteText(e.target.value)}
+                rows={3}
+              />
+              <div className="settings-actions">
+                <button
+                  className="btn btn-primary"
+                  onClick={handlePaste}
+                  disabled={!pasteText.trim()}
+                >
+                  <Clipboard size={14} />
+                  適用
+                </button>
+              </div>
+            </div>
+
+            <p className="settings-description">
+              PWAで使用している接続情報
+            </p>
+            {config ? (
+              <div className="g2-connection-box">
+                <pre className="g2-connection-data">
+                  {JSON.stringify(config)}
+                </pre>
+                <button
+                  className="btn btn-copy"
+                  onClick={handleCopyConnectionInfo}
+                >
+                  {copied ? (
+                    <>
+                      <Check size={14} />
+                      コピー済み
+                    </>
+                  ) : (
+                    <>
+                      <Copy size={14} />
+                      コピー
+                    </>
+                  )}
+                </button>
+              </div>
+            ) : (
+              <span className="status-disconnected">
+                <WifiOff size={14} />
+                接続情報なし
+              </span>
+            )}
+
+          </section>
+
+          {/* Connection Status */}
+          <section className="settings-section">
+            <h3>接続状況</h3>
+            <div className="connection-status">
+              {connected ? (
+                <span className="status-connected">
+                  <Wifi size={14} />
+                  Connected
+                </span>
+              ) : (
+                <span className="status-disconnected">
+                  <WifiOff size={14} />
+                  Not Connected
+                </span>
+              )}
+            </div>
+
+            {config && (
+              <div className="connection-info">
+                <div className="info-row">
+                  <span className="info-label">Tunnel URL</span>
+                  <span className="info-value">{config.url}</span>
+                </div>
+              </div>
+            )}
+
+            <div className="settings-actions">
+              <button
+                className="btn btn-primary"
+                onClick={() => setShowQRScanner(true)}
+              >
+                <Camera size={14} />
+                QRコードを読み取る
+              </button>
+              {config && (
+                <button className="btn btn-danger" onClick={handleClearConnection}>
+                  <Trash2 size={14} />
+                  接続を解除
+                </button>
+              )}
+            </div>
+          </section>
+
+          {/* QR Scanner */}
+          {showQRScanner && (
+            <section className="settings-section">
+              <h3>QR Scanner</h3>
+              <QRScanner
+                onScan={handleQRScan}
+                onError={(err) => setError(err)}
+                onClose={() => setShowQRScanner(false)}
+              />
+            </section>
+          )}
+
+          {/* Error Display */}
+          {error && (
+            <div className="settings-error">
+              <AlertCircle size={14} />
+              {error}
+            </div>
+          )}
+
+          {/* G2 Glass Control */}
+          {isBridgeAvailable && (
+            <section className="settings-section">
+              <h3>グラス起動・停止</h3>
+              <p className="settings-description">
+                EvenHub内PWAからグラス上で HomePilot を起動・停止します
+              </p>
+
+              <div className="settings-actions">
+                {g2RuntimeState === 'inactive' ? (
+                  <button
+                    className="btn btn-primary"
+                    onClick={onStartG2Runtime}
+                  >
+                    <Glasses size={14} />
+                    グラス起動
+                  </button>
+                ) : g2RuntimeState === 'active' ? (
+                  <button
+                    className="btn btn-danger"
+                    onClick={onStopG2Runtime}
+                  >
+                    <X size={14} />
+                    グラスを閉じる
+                  </button>
+                ) : (
+                  <button
+                    className="btn btn-secondary"
+                    disabled
+                  >
+                    {g2RuntimeState === 'starting' ? '起動中...' : '終了中...'}
+                  </button>
+                )}
+              </div>
+
+              {g2RuntimeState === 'active' && (
+                <div className="g2-status-active">
+                  <span className="status-dot active"></span>
+                  グラス起動中
+                </div>
+              )}
+            </section>
+          )}
+
+        </div>
+      </div>
+    </div>
+  );
+};
