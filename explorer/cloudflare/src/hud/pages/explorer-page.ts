@@ -2,6 +2,7 @@ import { TextContainerProperty } from "@evenrealities/even_hub_sdk";
 import { BasePage, PageRenderResult } from "../page-manager";
 import { FileSystemItem } from "../../domain/types";
 import { FileSystemService } from "../../services/FileSystemService";
+import { GatewayFileSystemService } from "../../services/GatewayFileSystemService";
 import { FileViewerPage } from "./file-viewer-page";
 
 export const G2_MAX_LIST_LINES = 9;
@@ -11,11 +12,12 @@ export class ExplorerPage extends BasePage {
   private currentPath: string;
   private items: FileSystemItem[] = [];
   private selectedIndex: number = 0;
-  private parentSelectedIndex?: number;
   private fileService: FileSystemService;
+  private gatewayService: GatewayFileSystemService | null;
   private onStateChange?: (path: string, items: FileSystemItem[], selectedIndex: number) => void;
   private onFileViewerStateChange?: (file: FileSystemItem, content: string) => void;
   private onAgentSessionList?: () => Promise<void>;
+  private onNavigateToHistory?: () => Promise<void>;
   private initialRestoreIndex?: number;
 
   constructor(
@@ -25,15 +27,19 @@ export class ExplorerPage extends BasePage {
     onFileViewerStateChange?: (file: FileSystemItem, content: string) => void,
     initialRestoreIndex?: number,
     onAgentSessionList?: () => Promise<void>,
+    gatewayService?: GatewayFileSystemService | null,
+    onNavigateToHistory?: () => Promise<void>,
   ) {
     super();
     this.pageType = "ExplorerPage";
     this.currentPath = currentPath;
     this.fileService = fileService;
+    this.gatewayService = gatewayService ?? null;
     this.onStateChange = onStateChange;
     this.onFileViewerStateChange = onFileViewerStateChange;
     this.initialRestoreIndex = initialRestoreIndex;
     this.onAgentSessionList = onAgentSessionList;
+    this.onNavigateToHistory = onNavigateToHistory;
   }
 
   public getCurrentPath(): string {
@@ -146,6 +152,7 @@ export class ExplorerPage extends BasePage {
       textObject: [headerProp, bodyProp],
       menuObject: {
         menuList: [
+          { id: "history", title: "閲覧履歴画面へ" },
           { id: "agent", title: "エージェント画面へ" },
           { id: "refresh", title: "更新" },
         ],
@@ -180,7 +187,6 @@ export class ExplorerPage extends BasePage {
     if (!item) return;
 
     if (item.type === "directory") {
-      this.parentSelectedIndex = this.selectedIndex;
       await this.loadDirectory(item.path);
       await this.navigate(this);
     } else {
@@ -188,9 +194,21 @@ export class ExplorerPage extends BasePage {
       const viewerPage = new FileViewerPage(
         item,
         this.fileService,
-        () => this.navigate(this),
+        async () => {
+          // Navigate back based on current file path
+          const parentPath = this.fileService.getParentPath(item.path);
+          const parentItems = await this.fileService.getDirectory(parentPath);
+          const idx = parentItems.findIndex(i => i.name === item.name);
+          const restoreIndex = idx >= 0 ? idx : 0;
+          await this.loadDirectory(parentPath, restoreIndex);
+          return this.navigate(this);
+        },
         this.onFileViewerStateChange,
         this.onAgentSessionList,
+        this.gatewayService,
+        this.onNavigateToHistory
+          ? () => this.onNavigateToHistory!()
+          : undefined,
       );
       await this.navigate(viewerPage);
     }
@@ -199,9 +217,11 @@ export class ExplorerPage extends BasePage {
   public async onDoubleClick() {
     const parentPath = this.fileService.getParentPath(this.currentPath);
     if (parentPath !== this.currentPath) {
-      // Non-root: go to parent directory
-      const restoreIndex = this.parentSelectedIndex;
-      this.parentSelectedIndex = undefined;
+      // Non-root: navigate to parent and select current folder by name
+      const currentName = this.currentPath.split(/[\/\\]/).pop() || '';
+      const parentItems = await this.fileService.getDirectory(parentPath);
+      const idx = parentItems.findIndex(item => item.name === currentName);
+      const restoreIndex = idx >= 0 ? idx : 0;
       await this.loadDirectory(parentPath, restoreIndex);
       await this.navigate(this);
     } else if (this.onAgentSessionList) {
@@ -223,6 +243,11 @@ export class ExplorerPage extends BasePage {
       case "agent":
         if (this.onAgentSessionList) {
           await this.onAgentSessionList();
+        }
+        break;
+      case "history":
+        if (this.onNavigateToHistory) {
+          await this.onNavigateToHistory();
         }
         break;
     }

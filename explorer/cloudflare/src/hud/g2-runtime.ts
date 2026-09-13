@@ -5,6 +5,7 @@ import {
 } from '@evenrealities/even_hub_sdk';
 import { PageManager, BasePage } from './page-manager';
 import { ExplorerPage } from './pages/explorer-page';
+import { HistoryPage } from './pages/history-page';
 import { AgentSessionListPage } from './g2-agent/pages/agent-session-list-page';
 import { AgentModelSelectPage } from './g2-agent/pages/agent-model-select-page';
 import { AgentChatPage } from './g2-agent/pages/agent-chat-page';
@@ -51,6 +52,8 @@ export class G2RuntimeManager {
   private agentReturnPage: BasePage | null = null;
   private sessionListPage: AgentSessionListPage | null = null;
   private modelSelectPage: AgentModelSelectPage | null = null;
+  private historyPage: HistoryPage | null = null;
+  private historyReturnPage: BasePage | null = null;
   private agentCurrentPath: string = '';
 
   // Last Agent page state (for Explorer → Agent return)
@@ -247,6 +250,8 @@ export class G2RuntimeManager {
         undefined,
         undefined,
         () => this.navigateToAgentFromExplorer(),
+        this.gatewayService,
+        () => this.navigateToHistory(),
       );
       await this.pageManager.navigateTo(explorerPage);
 
@@ -306,6 +311,8 @@ export class G2RuntimeManager {
     this.agentReturnPage = null;
     this.sessionListPage = null;
     this.modelSelectPage = null;
+    this.historyPage = null;
+    this.historyReturnPage = null;
     this.agentCurrentPath = '';
     this.lastAgentPage = 'sessionList';
     this.lastAgentSessionID = null;
@@ -337,6 +344,8 @@ export class G2RuntimeManager {
     this.agentReturnPage = null;
     this.sessionListPage = null;
     this.modelSelectPage = null;
+    this.historyPage = null;
+    this.historyReturnPage = null;
     this.agentCurrentPath = '';
     this.lastAgentPage = 'sessionList';
     this.lastAgentSessionID = null;
@@ -508,6 +517,68 @@ export class G2RuntimeManager {
       await this.navigateToAgentChat(this.lastAgentSessionID);
     } else {
       await this.navigateToSessionList();
+    }
+  }
+
+  // ── History Navigation ────────────────────────────────────
+
+  /**
+   * Navigate from Explorer/FileViewer to History page.
+   * Saves the current Explorer/FileViewer page for return navigation.
+   */
+  async navigateToHistory(): Promise<void> {
+    if (!this.pageManager || !this.gatewayService) return;
+
+    const currentPage = this.pageManager.getCurrentPage();
+    const isFromExplorer = currentPage?.pageType === 'ExplorerPage' || currentPage?.pageType === 'FileViewerPage';
+
+    // Save the return page only when entering from Explorer/FileViewer
+    if (isFromExplorer && !this.historyReturnPage) {
+      this.historyReturnPage = currentPage || null;
+    }
+
+    const fileService = this.gatewayService;
+
+    this.historyPage = new HistoryPage(
+      this.gatewayService,
+      fileService,
+      undefined,
+      undefined,
+      undefined,
+      () => this.navigateFromHistoryToExplorer(),
+    );
+
+    await this.pageManager.navigateTo(this.historyPage);
+  }
+
+  /**
+   * Navigate from History back to the original Explorer/FileViewer page.
+   * Restores the saved page instance (preserving path, selection, etc.).
+   */
+  async navigateFromHistoryToExplorer(): Promise<void> {
+    if (!this.pageManager) return;
+
+    const returnPage = this.historyReturnPage;
+    this.historyReturnPage = null;
+    this.historyPage = null;
+
+    if (returnPage) {
+      await this.pageManager.navigateTo(returnPage);
+    } else {
+      // Fallback: create new Explorer at root (should not happen in normal flow)
+      if (!this.gatewayService) return;
+      const rootPath = this.gatewayService.getRootPath();
+      const explorerPage = new ExplorerPage(
+        rootPath,
+        this.gatewayService,
+        undefined,
+        undefined,
+        undefined,
+        () => this.navigateToAgentFromExplorer(),
+        this.gatewayService,
+        () => this.navigateToHistory(),
+      );
+      await this.pageManager.navigateTo(explorerPage);
     }
   }
 

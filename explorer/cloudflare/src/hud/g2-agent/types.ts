@@ -1,6 +1,8 @@
 import {
   OpenCodeSessionInfo,
   OpenCodeProviderModel,
+  OpenCodeQuestionRequest,
+  OpenCodePermissionRequest,
 } from '../../domain/types';
 import { OpenCodeMessageWithParts } from './message-mapper';
 
@@ -14,11 +16,15 @@ export interface G2AgentState {
   messages: OpenCodeMessageWithParts[];
   isLoadingMessages: boolean;
 
+  pendingQuestions: OpenCodeQuestionRequest[];
+  pendingPermissions: OpenCodePermissionRequest[];
+
   processingSessionIDs: string[];
   unreadSessionIDs: string[];
 
   voiceState: G2VoiceState;
   transcript: string;
+  questionVoiceConfirm: boolean;
 
   models: OpenCodeProviderModel[];
   selectedModel: OpenCodeProviderModel | null;
@@ -32,10 +38,13 @@ export const createInitialG2AgentState = (): G2AgentState => ({
   selectedSession: null,
   messages: [],
   isLoadingMessages: false,
+  pendingQuestions: [],
+  pendingPermissions: [],
   processingSessionIDs: [],
   unreadSessionIDs: [],
   voiceState: 'idle',
   transcript: '',
+  questionVoiceConfirm: false,
   models: [],
   selectedModel: null,
   error: null,

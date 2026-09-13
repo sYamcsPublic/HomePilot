@@ -2,7 +2,7 @@ import { TextContainerProperty } from "@evenrealities/even_hub_sdk";
 import { BasePage, PageRenderResult } from "../../page-manager";
 import { G2AgentController } from "../g2-agent-controller";
 import { OpenCodeMessageWithParts } from "../message-mapper";
-import { AgentContext } from "../../../domain/types";
+import { AgentContext, OpenCodeQuestionRequest, OpenCodePermissionRequest } from "../../../domain/types";
 import { ExplorerPage } from "../../pages/explorer-page";
 import { FileViewerPage } from "../../pages/file-viewer-page";
 
@@ -65,6 +65,10 @@ export class AgentChatPage extends BasePage {
   private scrollInverted: boolean = false;
   private scrollToBottomAfterSend: boolean = false;
   private agentCreatedCache: Map<string, number> = new Map();
+  private questionSelectedIndex: number = 0;
+  private questionMultipleSelected: Set<string> = new Set();
+  private customSources: Set<string> = new Set();
+  private permissionSelectedIndex: number = 0;
 
   constructor(
     controller: G2AgentController,
@@ -89,6 +93,7 @@ export class AgentChatPage extends BasePage {
     this.buildChatText();
     this.buildWrappedLines();
     this.scrollLine = Math.max(0, this.wrappedLines.length - CHAT_MAX_LINES);
+    this.questionSelectedIndex = 0;
 
     this.stateUnsubscribe = this.controller.subscribe((state) => {
       if (this.isActive) {
@@ -98,6 +103,9 @@ export class AgentChatPage extends BasePage {
         if (this.scrollToBottomAfterSend) {
           this.scrollToBottomAfterSend = false;
           this.scrollLine = Math.max(0, this.wrappedLines.length - CHAT_MAX_LINES);
+        }
+        if (state.selectedSessionID && state.pendingPermissions.some((p) => p.sessionID === state.selectedSessionID)) {
+          this.permissionSelectedIndex = 0;
         }
         this.renderPage();
       }
@@ -277,20 +285,192 @@ export class AgentChatPage extends BasePage {
     }
   }
 
+  private truncateText(text: string, maxWidth: number): string {
+    let totalWidth = 0;
+    for (let i = 0; i < text.length; i++) {
+      const w = this.getCharWidth(text[i]);
+      if (totalWidth + w > maxWidth) {
+        return text.substring(0, i) + '...';
+      }
+      totalWidth += w;
+    }
+    return text;
+  }
+
+  private buildQuestionBody(q: OpenCodeQuestionRequest): string {
+    if (q.multiple === true && (q.options?.length ?? 0) >= 4) {
+      const lines: string[] = [];
+      if (q.header) {
+        lines.push(`[${this.truncateText(q.header, CHAT_MAX_WIDTH - this.getStringWidth('[]'))}]`);
+        lines.push("");
+      }
+      if (q.question) {
+        const qLines = this.wrapLine(q.question, CHAT_MAX_WIDTH);
+        const messageLines = 2;
+        const headerLines = q.header ? 2 : 0;
+        const blankAfterQuestion = 1;
+        const qBudget = CHAT_MAX_LINES - messageLines - headerLines - blankAfterQuestion;
+        const take = Math.min(qLines.length, qBudget);
+        const truncated = qLines.length > qBudget;
+        for (let i = 0; i < take; i++) {
+          if (i === take - 1 && truncated) {
+            const ellipsisWidth = this.getCharWidth('.') * 3;
+            lines.push(this.truncateText(qLines[i], CHAT_MAX_WIDTH - ellipsisWidth));
+          } else {
+            lines.push(qLines[i]);
+          }
+        }
+        lines.push("");
+      }
+      lines.push("選択肢が多いため");
+      lines.push("PWAで回答してください");
+      while (lines.length < CHAT_MAX_LINES) {
+        lines.push("");
+      }
+      return lines.join("\n");
+    }
+
+    const MAX_LINES = CHAT_MAX_LINES;
+    const GUIDE_LINES = 1;
+    const OPTION_LINES = 1;
+    const DESC_LINES = 2;
+    const isMultiple = q.multiple === true;
+    const OPTION_COUNT = q.options?.length ?? 0;
+    const CUSTOM_COUNT = this.customSources.size;
+    const ALL_ITEM_COUNT = OPTION_COUNT + CUSTOM_COUNT;
+    const TOTAL_ITEMS = isMultiple ? ALL_ITEM_COUNT + 1 : ALL_ITEM_COUNT;
+
+    const guideAndGap = GUIDE_LINES + 1;
+    const GAP_AFTER_QUESTION = 1;
+    const optionsTotal = TOTAL_ITEMS * OPTION_LINES;
+    const descBudget = Math.max(0, MAX_LINES - guideAndGap - GAP_AFTER_QUESTION - optionsTotal);
+    const questionBudget = Math.max(0, MAX_LINES - guideAndGap - GAP_AFTER_QUESTION - optionsTotal);
+
+    const lines: string[] = [];
+    let lineCount = 0;
+
+    if (q.question && questionBudget > 0) {
+      const qLines = this.wrapLine(q.question, CHAT_MAX_WIDTH);
+      const take = Math.min(qLines.length, questionBudget);
+      for (let i = 0; i < take; i++) {
+        if (i === take - 1 && qLines.length > questionBudget) {
+          const ellipsisWidth = this.getCharWidth('.') * 3;
+          lines.push(this.truncateText(qLines[i], CHAT_MAX_WIDTH - ellipsisWidth) + "...");
+        } else {
+          lines.push(qLines[i]);
+        }
+        lineCount++;
+      }
+      lines.push("");
+      lineCount++;
+    }
+
+    if (q.options && q.options.length > 0) {
+      for (let i = 0; i < q.options.length; i++) {
+        const opt = q.options[i];
+        const isFocused = i === this.questionSelectedIndex;
+
+        if (isMultiple) {
+          const checked = this.questionMultipleSelected.has(opt.label);
+          const checkMark = checked ? '[X]' : '[ ]';
+          const focusMark = isFocused ? '>' : ' ';
+          const prefix = `${focusMark}${checkMark} `;
+          const prefixWidth = this.getStringWidth(prefix);
+          const labelMax = CHAT_MAX_WIDTH - prefixWidth;
+          lines.push(`${prefix}${this.truncateText(opt.label, labelMax)}`);
+        } else {
+          const prefix = isFocused ? "> " : "  ";
+          const prefixWidth = this.getStringWidth(prefix);
+          const labelMax = CHAT_MAX_WIDTH - prefixWidth;
+          lines.push(`${prefix}${this.truncateText(opt.label, labelMax)}`);
+        }
+        lineCount++;
+
+        if (isFocused && opt.description && descBudget > 0) {
+          const dLines = this.wrapLine(opt.description, CHAT_MAX_WIDTH - 2);
+          const dTake = Math.min(dLines.length, Math.min(DESC_LINES, descBudget));
+          for (let d = 0; d < dTake; d++) {
+            if (d === dTake - 1 && dLines.length > dTake) {
+              const indentWidth = this.getStringWidth('  ');
+              const ellipsisWidth = this.getCharWidth('.') * 3;
+              lines.push(`  ${this.truncateText(dLines[d], CHAT_MAX_WIDTH - indentWidth - ellipsisWidth)}...`);
+            } else {
+              lines.push(`  ${dLines[d]}`);
+            }
+            lineCount++;
+          }
+        }
+      }
+    }
+
+    if (isMultiple) {
+      let customIndex = 0;
+      for (const customText of this.questionMultipleSelected) {
+        if (this.customSources.has(customText)) {
+          const isFocused = this.questionSelectedIndex === OPTION_COUNT + customIndex;
+          const prefix = isFocused ? '>[X] ' : ' [X] ';
+          const prefixWidth = this.getStringWidth(prefix);
+          const labelMax = CHAT_MAX_WIDTH - prefixWidth;
+          lines.push(`${prefix}${this.truncateText(customText, labelMax)}`);
+          lineCount++;
+          customIndex++;
+        }
+      }
+
+      const confirmIndex = ALL_ITEM_COUNT;
+      const isConfirmFocused = this.questionSelectedIndex === confirmIndex;
+      const confirmPrefix = isConfirmFocused ? "> " : "  ";
+      lines.push(`${confirmPrefix}[回答する]`);
+      lineCount++;
+    }
+
+    while (lineCount < MAX_LINES - GUIDE_LINES) {
+      lines.push("");
+      lineCount++;
+    }
+
+    const guideLine = q.custom !== false
+      ? "Tap: Select  Double: Skip  Long: Voice"
+      : "Tap: Select  Double: Skip";
+    lines.push(guideLine);
+
+    return lines.join("\n");
+  }
+
   public render(): PageRenderResult {
-    const voiceState = this.controller.getState().voiceState;
+    const state = this.controller.getState();
+    const voiceState = state.voiceState;
+    const currentQuestion = this.getCurrentSessionQuestion();
+    const qvConfirm = state.questionVoiceConfirm;
+    const isQuestionMode = currentQuestion !== null && voiceState === 'idle';
+    const isQuestionVoice = currentQuestion !== null && qvConfirm && voiceState !== 'idle';
+    const isPermissionMode = this.isPermissionMode();
 
     const headerProp = new TextContainerProperty({
       containerID: 1,
       containerName: "chat_header",
-      content: voiceState !== 'idle'
-        ? "[Voice Input]"
-        : this.buildHeaderLine(
+      content: (isQuestionMode || isQuestionVoice)
+        ? this.buildHeaderLine(
             this.currentPath || "Chat",
             "",
             CHAT_MAX_WIDTH,
-            `[${this.modelName}]`,
-          ),
+            "[Question]",
+          )
+        : isPermissionMode
+          ? this.buildHeaderLine(
+              this.currentPath || "Chat",
+              "",
+              CHAT_MAX_WIDTH,
+              "[Permission]",
+            )
+          : voiceState !== 'idle'
+            ? "[Voice Input]"
+            : this.buildHeaderLine(
+                this.currentPath || "Chat",
+                "",
+                CHAT_MAX_WIDTH,
+                `[${this.modelName}]`,
+              ),
       xPosition: 4,
       yPosition: 2,
       width: 572,
@@ -301,7 +481,26 @@ export class AgentChatPage extends BasePage {
 
     let bodyContent: string;
 
-    if (voiceState === 'ready') {
+    if (isPermissionMode) {
+      const perm = this.getCurrentSessionPermission();
+      if (perm) {
+        bodyContent = this.buildPermissionBody(perm);
+      } else {
+        bodyContent = this.wrappedLines.length > 0
+          ? this.wrappedLines.slice(this.scrollLine, Math.min(this.scrollLine + CHAT_MAX_LINES, this.wrappedLines.length)).join("\n")
+          : "  (No messages yet)";
+      }
+    } else if (isQuestionMode && currentQuestion) {
+      bodyContent = this.buildQuestionBody(currentQuestion);
+    } else if (isQuestionVoice && voiceState === 'ready') {
+      bodyContent = "VOICE INPUT\n\nListening...";
+    } else if (isQuestionVoice && voiceState === 'transcribing') {
+      bodyContent = "VOICE INPUT\n\nTranscribing...";
+    } else if (isQuestionVoice && voiceState === 'confirmation') {
+      const transcript = this.controller.getState().transcript;
+      const wrappedTranscript = this.wrapLine(transcript, CHAT_MAX_WIDTH).join("\n");
+      bodyContent = `回答内容を確認\n\n${wrappedTranscript}\n\nTap: Send\nDouble: Cancel`;
+    } else if (voiceState === 'ready') {
       bodyContent = "VOICE INPUT\n\nListening...";
     } else if (voiceState === 'transcribing') {
       bodyContent = "VOICE INPUT\n\nTranscribing...";
@@ -358,7 +557,114 @@ export class AgentChatPage extends BasePage {
     };
   }
 
+  private isQuestionMode(): boolean {
+    return this.getCurrentSessionQuestion() !== null && this.controller.getState().voiceState === 'idle';
+  }
+
+  private isQuestionVoiceActive(): boolean {
+    const state = this.controller.getState();
+    return this.getCurrentSessionQuestion() !== null && state.questionVoiceConfirm && state.voiceState !== 'idle';
+  }
+
+  private isTooManyMultipleOptions(): boolean {
+    const q = this.getCurrentSessionQuestion();
+    return !!q && q.multiple === true && (q.options?.length ?? 0) >= 4;
+  }
+
+  private getCurrentSessionQuestion(): OpenCodeQuestionRequest | null {
+    const state = this.controller.getState();
+    if (!state.selectedSessionID) return null;
+    return state.pendingQuestions.find((q) => q.sessionID === state.selectedSessionID) || null;
+  }
+
+  private isPermissionMode(): boolean {
+    const state = this.controller.getState();
+    if (state.voiceState !== 'idle') return false;
+    if (!state.selectedSessionID) return false;
+    return state.pendingPermissions.some((p) => p.sessionID === state.selectedSessionID);
+  }
+
+  private getCurrentSessionPermission(): OpenCodePermissionRequest | null {
+    const state = this.controller.getState();
+    if (!state.selectedSessionID) return null;
+    return state.pendingPermissions.find((p) => p.sessionID === state.selectedSessionID) || null;
+  }
+
+  private buildPermissionBody(perm: OpenCodePermissionRequest): string {
+    const METADATA_LABEL_MAP: Record<string, string> = { filepath: 'ファイル', parentDir: '親フォルダ' };
+    const OPTION_LABELS = ['拒否', '一度だけ許可', '常に許可'];
+
+    const MAX_LINES = CHAT_MAX_LINES;
+    const GUIDE_LINES = 1;
+
+    const lines: string[] = [];
+    let lineCount = 0;
+
+    if (perm.permission) {
+      lines.push(perm.permission);
+      lineCount++;
+    }
+
+    if (perm.patterns && perm.patterns.length > 0) {
+      for (const pat of perm.patterns) {
+        const prefixWidth = this.getStringWidth('  ');
+        const maxW = CHAT_MAX_WIDTH - prefixWidth;
+        lines.push(`  ${this.truncateText(pat, maxW)}`);
+        lineCount++;
+      }
+    }
+
+    if (perm.metadata) {
+      const keys = ['filepath', 'parentDir'];
+      for (const key of keys) {
+        const val = perm.metadata[key];
+        if (val != null) {
+          const label = METADATA_LABEL_MAP[key] || key;
+          const prefix = `${label}: `;
+          const prefixWidth = this.getStringWidth(prefix);
+          const maxW = CHAT_MAX_WIDTH - prefixWidth;
+          lines.push(`${prefix}${this.truncateText(String(val), maxW)}`);
+          lineCount++;
+        }
+      }
+    }
+
+    for (let i = 0; i < OPTION_LABELS.length; i++) {
+      const isFocused = i === this.permissionSelectedIndex;
+      const prefix = isFocused ? '> ' : '  ';
+      const prefixWidth = this.getStringWidth(prefix);
+      const maxW = CHAT_MAX_WIDTH - prefixWidth;
+      lines.push(`${prefix}${this.truncateText(OPTION_LABELS[i], maxW)}`);
+      lineCount++;
+    }
+
+    while (lineCount < MAX_LINES - GUIDE_LINES) {
+      lines.push('');
+      lineCount++;
+    }
+
+    lines.push('Tap: Select  Double: Back');
+
+    return lines.join('\n');
+  }
+
   public async onScrollUp() {
+    if (this.isQuestionVoiceActive()) return;
+    if (this.isPermissionMode()) {
+      if (this.permissionSelectedIndex > 0) {
+        this.permissionSelectedIndex--;
+        await this.renderPage();
+      }
+      return;
+    }
+    if (this.isQuestionMode()) {
+      if (this.isTooManyMultipleOptions()) return;
+      if (this.questionSelectedIndex > 0) {
+        this.questionSelectedIndex--;
+        await this.renderPage();
+      }
+      return;
+    }
     if (this.scrollInverted) {
       if (this.scrollLine > 0) {
         this.scrollLine = Math.max(this.scrollLine - SCROLL_STEP, 0);
@@ -373,6 +679,29 @@ export class AgentChatPage extends BasePage {
   }
 
   public async onScrollDown() {
+    if (this.isQuestionVoiceActive()) return;
+    if (this.isPermissionMode()) {
+      if (this.permissionSelectedIndex < 2) {
+        this.permissionSelectedIndex++;
+        await this.renderPage();
+      }
+      return;
+    }
+    if (this.isQuestionMode()) {
+      if (this.isTooManyMultipleOptions()) return;
+      const q = this.getCurrentSessionQuestion();
+      if (!q) return;
+      const optionCount = q.options?.length ?? 0;
+      const customCount = this.customSources.size;
+      const maxIndex = q.multiple
+        ? optionCount + customCount
+        : optionCount - 1;
+      if (this.questionSelectedIndex < maxIndex) {
+        this.questionSelectedIndex++;
+        await this.renderPage();
+      }
+      return;
+    }
     if (this.scrollInverted) {
       if (this.scrollLine < this.wrappedLines.length - CHAT_MAX_LINES) {
         this.scrollLine = Math.min(this.scrollLine + SCROLL_STEP, this.wrappedLines.length - CHAT_MAX_LINES);
@@ -430,7 +759,107 @@ export class AgentChatPage extends BasePage {
     };
   }
 
+  private async answerQuestion(answer: string | string[]): Promise<void> {
+    const q = this.getCurrentSessionQuestion();
+    if (!q) return;
+    this.questionSelectedIndex = 0;
+    this.questionMultipleSelected = new Set();
+    this.customSources = new Set();
+    await this.controller.respondQuestion(q.id, answer);
+  }
+
+  private buildMultipleAnswer(): string[] {
+    const q = this.getCurrentSessionQuestion();
+    if (!q) return [];
+    const optionLabels = (q.options ?? []).map((o) => o.label);
+    const selectedOptions = [...this.questionMultipleSelected].filter((t) => !this.customSources.has(t));
+    const customTexts = [...this.questionMultipleSelected].filter((t) => this.customSources.has(t));
+    const answer: string[] = [];
+    for (const item of selectedOptions) {
+      if (optionLabels.includes(item)) answer.push(item);
+    }
+    for (const item of customTexts) {
+      answer.push(item);
+    }
+    return answer;
+  }
+
   public async onClick() {
+    if (this.isQuestionVoiceActive()) {
+      const state = this.controller.getState();
+      if (state.voiceState === 'confirmation') {
+        const transcript = await this.controller.confirmQuestionVoice();
+        if (transcript) {
+          this.questionMultipleSelected.add(transcript);
+          this.customSources.add(transcript);
+          await this.renderPage();
+        }
+      }
+      return;
+    }
+
+    if (this.isPermissionMode()) {
+      const perm = this.getCurrentSessionPermission();
+      if (perm) {
+        const replies: Array<'deny' | 'grant' | 'always'> = ['deny', 'grant', 'always'];
+        const reply = replies[this.permissionSelectedIndex];
+        if (reply) {
+          await this.controller.respondPermission(perm.id, reply);
+        }
+      }
+      return;
+    }
+
+    if (this.isQuestionMode()) {
+      if (this.isTooManyMultipleOptions()) return;
+      const q = this.getCurrentSessionQuestion();
+      if (!q) return;
+      const optionCount = q.options?.length ?? 0;
+
+      if (q.multiple) {
+        const allItems = optionCount + this.customSources.size;
+        const confirmIndex = allItems;
+
+        if (this.questionSelectedIndex === confirmIndex) {
+          const answer = this.buildMultipleAnswer();
+          await this.answerQuestion(answer);
+        } else if (this.questionSelectedIndex < optionCount) {
+          const label = q.options![this.questionSelectedIndex].label;
+          const next = new Set(this.questionMultipleSelected);
+          if (next.has(label)) {
+            next.delete(label);
+          } else {
+            next.add(label);
+          }
+          this.questionMultipleSelected = next;
+          await this.renderPage();
+        } else {
+          const customList = [...this.questionMultipleSelected].filter((t) => this.customSources.has(t));
+          const customIdx = this.questionSelectedIndex - optionCount;
+          const text = customList[customIdx];
+          if (text) {
+            const next = new Set(this.questionMultipleSelected);
+            if (next.has(text)) {
+              next.delete(text);
+              this.customSources.delete(text);
+            } else {
+              next.add(text);
+            }
+            this.questionMultipleSelected = next;
+            await this.renderPage();
+          }
+        }
+      } else {
+        if (q.options && q.options.length > 0) {
+          const selected = q.options[this.questionSelectedIndex];
+          if (selected) {
+            await this.answerQuestion(selected.label);
+          }
+        }
+      }
+      return;
+    }
+
     const voiceState = this.controller.getState().voiceState;
     if (voiceState === 'confirmation') {
       const transcript = this.controller.getState().transcript;
@@ -444,6 +873,25 @@ export class AgentChatPage extends BasePage {
   }
 
   public async onDoubleClick() {
+    if (this.isQuestionVoiceActive()) {
+      this.controller.cancelVoiceInput();
+      return;
+    }
+
+    if (this.isPermissionMode()) {
+      await this.onReturnToList();
+      return;
+    }
+
+    if (this.isQuestionMode()) {
+      if (this.isTooManyMultipleOptions()) {
+        await this.onReturnToList();
+        return;
+      }
+      await this.answerQuestion('');
+      return;
+    }
+
     const voiceState = this.controller.getState().voiceState;
     if (voiceState === 'transcribing' || voiceState === 'confirmation') {
       this.controller.cancelVoiceInput();
@@ -455,10 +903,25 @@ export class AgentChatPage extends BasePage {
   }
 
   public async onLongPress() {
+    if (this.isPermissionMode()) return;
+    const state = this.controller.getState();
+    const q = this.getCurrentSessionQuestion();
+    if (q && state.voiceState === 'idle') {
+      if (q.multiple === true && (q.options?.length ?? 0) >= 4) return;
+      if (q.custom !== false) {
+        await this.controller.startQuestionVoiceInput();
+      }
+      return;
+    }
     await this.controller.startVoiceInput();
   }
 
   public async onLongPressRelease() {
+    const state = this.controller.getState();
+    if (state.questionVoiceConfirm && state.voiceState === 'ready') {
+      await this.controller.stopQuestionVoiceInput();
+      return;
+    }
     await this.controller.stopVoiceInput();
   }
 

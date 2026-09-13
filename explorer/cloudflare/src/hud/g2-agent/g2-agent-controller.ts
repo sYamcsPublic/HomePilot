@@ -164,6 +164,55 @@ export class G2AgentController {
       const msg = e instanceof Error ? e.message : 'Failed to load messages';
       this.updateState({ isLoadingMessages: false, error: msg });
     }
+
+    await this.fetchPendingQuestions();
+    await this.fetchPendingPermissions();
+  }
+
+  async fetchPendingQuestions(): Promise<void> {
+    if (!this.client) return;
+    try {
+      const pendingQuestions = await this.client.getPendingQuestions();
+      this.updateState({ pendingQuestions });
+    } catch {
+      // Non-critical: pending questions failure should not break agent chat
+    }
+  }
+
+  async fetchPendingPermissions(): Promise<void> {
+    if (!this.client) return;
+    try {
+      const pendingPermissions = await this.client.getPendingPermissions();
+      this.updateState({ pendingPermissions });
+    } catch {
+      // Non-critical: pending permissions failure should not break agent chat
+    }
+  }
+
+  async respondQuestion(questionID: string, answer: string | string[]): Promise<void> {
+    if (!this.client) return;
+    try {
+      await this.client.respondQuestion(questionID, answer);
+      this.updateState({
+        pendingQuestions: this.state.pendingQuestions.filter((q) => q.id !== questionID),
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Failed to respond to question';
+      this.updateState({ error: msg });
+    }
+  }
+
+  async respondPermission(permissionID: string, response: 'grant' | 'deny' | 'always'): Promise<void> {
+    if (!this.client) return;
+    try {
+      await this.client.respondPermission(permissionID, response);
+      this.updateState({
+        pendingPermissions: this.state.pendingPermissions.filter((p) => p.id !== permissionID),
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Failed to respond to permission';
+      this.updateState({ error: msg });
+    }
   }
 
   async createSession(model: OpenCodeProviderModel): Promise<string | null> {
@@ -246,6 +295,8 @@ export class G2AgentController {
       const messages = mapApiMessagesToWithParts(apiMessages, sessionID);
       this.updateState({ messages });
       this.checkAndClearProcessing(sessionID, messages);
+      await this.fetchPendingQuestions();
+      await this.fetchPendingPermissions();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : 'Failed to send message';
       // Do NOT clear persistent processing entry here.
@@ -437,7 +488,48 @@ export class G2AgentController {
     this.updateState({
       voiceState: 'idle',
       transcript: '',
+      questionVoiceConfirm: false,
     });
+  }
+
+  async startQuestionVoiceInput(): Promise<void> {
+    if (!this.bridge) {
+      this.updateState({ error: 'Voice input not available' });
+      return;
+    }
+    if (this.state.voiceState !== 'idle') return;
+    if (this.state.pendingQuestions.length === 0) return;
+
+    this.updateState({ questionVoiceConfirm: true });
+    await this.startVoiceInput();
+  }
+
+  async stopQuestionVoiceInput(): Promise<void> {
+    if (this.state.voiceState !== 'ready') return;
+    if (!this.state.questionVoiceConfirm) return;
+    await this.stopVoiceInput();
+  }
+
+  async confirmQuestionVoice(): Promise<string | null> {
+    if (this.state.voiceState !== 'confirmation') return null;
+    if (!this.state.questionVoiceConfirm) return null;
+
+    const transcript = this.state.transcript;
+    this.updateState({ voiceState: 'idle', transcript: '', questionVoiceConfirm: false });
+
+    if (!transcript || this.state.pendingQuestions.length === 0) return null;
+
+    const q = this.state.selectedSessionID
+      ? this.state.pendingQuestions.find((q) => q.sessionID === this.state.selectedSessionID) || null
+      : null;
+    if (!q) return null;
+
+    if (q.multiple) {
+      return transcript;
+    }
+
+    await this.respondQuestion(q.id, transcript);
+    return null;
   }
 
   private stopMic(): void {
@@ -499,7 +591,7 @@ export class G2AgentController {
 
   private async sendTranscribeRequest(wavBlob: Blob, requestId: number): Promise<void> {
     if (!this.client) {
-      this.updateState({ voiceState: 'idle', error: 'Gateway not connected' });
+      this.updateState({ voiceState: 'idle', questionVoiceConfirm: false, error: 'Gateway not connected' });
       return;
     }
 
@@ -527,12 +619,12 @@ export class G2AgentController {
 
       if (!res.ok) {
         const msg = json?.error?.message || `Gateway returned HTTP ${res.status}`;
-        this.updateState({ voiceState: 'idle', error: msg });
+        this.updateState({ voiceState: 'idle', questionVoiceConfirm: false, error: msg });
         return;
       }
 
       if (typeof json.text !== 'string' || !json.text.trim()) {
-        this.updateState({ voiceState: 'idle', error: 'No speech detected' });
+        this.updateState({ voiceState: 'idle', questionVoiceConfirm: false, error: 'No speech detected' });
         return;
       }
 
@@ -548,7 +640,7 @@ export class G2AgentController {
       }
 
       const msg = e instanceof Error ? e.message : 'Failed to connect to Gateway';
-      this.updateState({ voiceState: 'idle', error: msg });
+      this.updateState({ voiceState: 'idle', questionVoiceConfirm: false, error: msg });
     } finally {
       if (this.abortController === abortController) {
         this.abortController = null;

@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { ArrowLeft, RefreshCw, Settings, Bot, FolderOpen, ArrowLeftRight } from 'lucide-react';
+import { ArrowLeft, RefreshCw, Settings, Bot, FolderOpen, ArrowLeftRight, MoreVertical } from 'lucide-react';
 import { truncatePath, computeHeadTailPath } from '../utils/pathUtils';
 
 export type NavbarMode = 'explorer' | 'agent';
@@ -22,6 +22,8 @@ interface ExplorerNavbarProps extends NavbarBaseProps {
   onReload: () => void;
   onOpenSettings: () => void;
   onOpenAgent: () => void;
+  onPathBarClick?: () => void;
+  onOpenActionMenu?: (e: React.MouseEvent) => void;
 }
 
 interface AgentNavbarProps extends NavbarBaseProps {
@@ -31,6 +33,7 @@ interface AgentNavbarProps extends NavbarBaseProps {
   onReload: () => void;
   onOpenSettings: () => void;
   onOpenExplorer: () => void;
+  onOpenActionMenu?: (e: React.MouseEvent) => void;
 }
 
 type NavbarProps = ExplorerNavbarProps | AgentNavbarProps;
@@ -70,7 +73,8 @@ export const Navbar: React.FC<NavbarProps> = (props) => {
         + parseFloat(getComputedStyle(badgeEl).marginRight || '0')
       : 0;
 
-    const available = innerWidth - badgeWidth;
+    const menuBtnWidth = props.onOpenActionMenu ? 32 : 0;
+    const available = innerWidth - badgeWidth - menuBtnWidth;
     if (available <= 0) {
       setDisplayPath(truncatePath(props.currentPath));
       return;
@@ -126,9 +130,23 @@ export const Navbar: React.FC<NavbarProps> = (props) => {
               Root: {truncatePath(props.rootPath)}
             </span>
           )}
-          <span className="path-bar-text" title={props.currentPath}>
+          <span
+            className="path-bar-text"
+            title="Click to view history"
+            onClick={props.mode === 'explorer' ? props.onPathBarClick : undefined}
+            style={props.mode === 'explorer' ? { cursor: 'pointer' } : undefined}
+          >
             {displayPath}
           </span>
+          {props.onOpenActionMenu && (
+            <button
+              className="btn-icon path-bar-menu-btn"
+              onClick={props.onOpenActionMenu}
+              title="Actions"
+            >
+              <MoreVertical size={16} />
+            </button>
+          )}
         </nav>
       </div>
     );
@@ -184,6 +202,15 @@ export const Navbar: React.FC<NavbarProps> = (props) => {
         <span className="path-bar-text" title={props.currentPath}>
           {displayPath}
         </span>
+        {props.onOpenActionMenu && (
+          <button
+            className="btn-icon path-bar-menu-btn"
+            onClick={props.onOpenActionMenu}
+            title="Actions"
+          >
+            <MoreVertical size={16} />
+          </button>
+        )}
       </nav>
     </div>
   );

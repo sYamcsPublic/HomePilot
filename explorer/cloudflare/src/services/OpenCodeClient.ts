@@ -197,11 +197,26 @@ export class OpenCodeClient {
   }
 
   async respondPermission(permissionID: string, response: 'grant' | 'deny' | 'always'): Promise<void> {
-    await this.request<void>('POST', `/permission/${permissionID}`, { response });
+    const replyMap: Record<'grant' | 'deny' | 'always', 'once' | 'reject' | 'always'> = {
+      grant: 'once',
+      deny: 'reject',
+      always: 'always',
+    };
+    const reply = replyMap[response];
+    try {
+      await this.request<void>('POST', `/permission/${permissionID}/reply`, { reply });
+      console.log('[Permission] POST success', { id: permissionID, response, reply });
+    } catch (e: unknown) {
+      console.error('[Permission] POST failed', { id: permissionID, response, reply, error: e instanceof Error ? e.message : e });
+      throw e;
+    }
   }
 
   async respondQuestion(questionID: string, answer: string | string[]): Promise<void> {
-    await this.request<void>('POST', `/question/${questionID}`, { answer });
+    const answers = Array.isArray(answer)
+      ? [answer]
+      : [[answer]];
+    await this.request<void>('POST', `/question/${questionID}/reply`, { answers });
   }
 
   async getProjects(): Promise<OpenCodeProject[]> {
@@ -278,8 +293,19 @@ export class OpenCodeClient {
 
   async getPendingPermissions(): Promise<OpenCodePermissionRequest[]> {
     const data = await this.request<unknown>('GET', '/permission');
+    let result: OpenCodePermissionRequest[] = [];
     if (Array.isArray(data)) {
-      return data.map((item: Record<string, unknown>) => ({
+      result = data.map((item: Record<string, unknown>) => ({
+        id: (item.id as string) || '',
+        sessionID: (item.sessionID as string) || '',
+        permission: (item.permission as string) || '',
+        patterns: Array.isArray(item.patterns) ? item.patterns as string[] : [],
+        metadata: item.metadata as Record<string, unknown> | undefined,
+        always: Array.isArray(item.always) ? item.always as string[] : undefined,
+        tool: item.tool as { messageID?: string; callID?: string } | undefined,
+      }));
+    } else if (data && typeof data === 'object' && 'value' in data && Array.isArray((data as Record<string, unknown>).value)) {
+      result = ((data as { value: Array<Record<string, unknown>> }).value).map((item) => ({
         id: (item.id as string) || '',
         sessionID: (item.sessionID as string) || '',
         permission: (item.permission as string) || '',
@@ -289,45 +315,62 @@ export class OpenCodeClient {
         tool: item.tool as { messageID?: string; callID?: string } | undefined,
       }));
     }
-    if (data && typeof data === 'object' && 'value' in data && Array.isArray((data as Record<string, unknown>).value)) {
-      return ((data as { value: Array<Record<string, unknown>> }).value).map((item) => ({
-        id: (item.id as string) || '',
-        sessionID: (item.sessionID as string) || '',
-        permission: (item.permission as string) || '',
-        patterns: Array.isArray(item.patterns) ? item.patterns as string[] : [],
-        metadata: item.metadata as Record<string, unknown> | undefined,
-        always: Array.isArray(item.always) ? item.always as string[] : undefined,
-        tool: item.tool as { messageID?: string; callID?: string } | undefined,
-      }));
-    }
-    return [];
+    console.log('[Permission] GET result', {
+      count: result.length,
+      ids: result.map((p) => p.id),
+      permissions: result.map((p) => ({ id: p.id, sessionID: p.sessionID, permission: p.permission, patterns: p.patterns })),
+    });
+    return result;
   }
 
   async getPendingQuestions(): Promise<OpenCodeQuestionRequest[]> {
     const data = await this.request<unknown>('GET', '/question');
+
+    const requests: Array<Record<string, unknown>> = [];
     if (Array.isArray(data)) {
-      return data.map((item: Record<string, unknown>) => ({
-        id: (item.id as string) || '',
-        sessionID: (item.sessionID as string) || '',
-        question: (item.question as string) || '',
-        header: item.header as string | undefined,
-        options: Array.isArray(item.options) ? item.options as Array<{ label: string; description?: string }> : undefined,
-        multiple: item.multiple as boolean | undefined,
-        tool: item.tool as { messageID?: string; callID?: string } | undefined,
-      }));
+      requests.push(...(data as Array<Record<string, unknown>>));
+    } else if (data && typeof data === 'object' && 'value' in data && Array.isArray((data as Record<string, unknown>).value)) {
+      requests.push(...((data as { value: Array<Record<string, unknown>> }).value));
     }
-    if (data && typeof data === 'object' && 'value' in data && Array.isArray((data as Record<string, unknown>).value)) {
-      return ((data as { value: Array<Record<string, unknown>> }).value).map((item) => ({
-        id: (item.id as string) || '',
-        sessionID: (item.sessionID as string) || '',
-        question: (item.question as string) || '',
-        header: item.header as string | undefined,
-        options: Array.isArray(item.options) ? item.options as Array<{ label: string; description?: string }> : undefined,
-        multiple: item.multiple as boolean | undefined,
-        tool: item.tool as { messageID?: string; callID?: string } | undefined,
-      }));
+
+    const result: OpenCodeQuestionRequest[] = [];
+    for (const item of requests) {
+      const parentID = (item.id as string) || '';
+      const sessionID = (item.sessionID as string) || '';
+      const tool = item.tool as { messageID?: string; callID?: string } | undefined;
+      const questions = Array.isArray(item.questions) ? item.questions as Array<Record<string, unknown>> : [];
+
+      if (questions.length === 0) {
+        const q = (item.question as string) || '';
+        if (q || item.header || item.options) {
+          result.push({
+            id: parentID,
+            sessionID,
+            question: q,
+            header: item.header as string | undefined,
+            options: Array.isArray(item.options) ? item.options as Array<{ label: string; description?: string }> : undefined,
+            multiple: item.multiple as boolean | undefined,
+            custom: item.custom as boolean | undefined,
+            tool,
+          });
+        }
+      } else {
+        for (let i = 0; i < questions.length; i++) {
+          const qItem = questions[i];
+          result.push({
+            id: questions.length === 1 ? parentID : `${parentID}_${i}`,
+            sessionID,
+            question: (qItem.question as string) || '',
+            header: qItem.header as string | undefined,
+            options: Array.isArray(qItem.options) ? qItem.options as Array<{ label: string; description?: string }> : undefined,
+            multiple: qItem.multiple as boolean | undefined,
+            custom: qItem.custom as boolean | undefined,
+            tool,
+          });
+        }
+      }
     }
-    return [];
+    return result;
   }
 
   getGatewayUrl(): string {

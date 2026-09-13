@@ -1,9 +1,10 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Plus, Mic, Send, AlertCircle, Loader2, Archive, ArchiveRestore, Trash2, Square } from 'lucide-react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Plus, Mic, Send, AlertCircle, Loader2, Archive, Square, Copy, Check } from 'lucide-react';
 import { OpenCodeSessionInfo, OpenCodeProviderModel, AgentContext } from '../domain/types';
 import { useOpenCode, OpenCodeMessageWithParts } from '../hooks/useOpenCode';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 import { Navbar } from './Navbar';
+import { ContextActionMenu, ContextActionMenuItem } from './ContextActionMenu';
 
 interface AgentScreenProps {
   currentPath: string;
@@ -36,7 +37,10 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
   const [connected, setConnected] = useState<boolean>(false);
   const [showArchivedSessions, setShowArchivedSessions] = useState<boolean>(false);
   const [operatingSessionId, setOperatingSessionId] = useState<string | null>(null);
-  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(new Set());
+  const [showSessionActionMenu, setShowSessionActionMenu] = useState<boolean>(false);
+  const [sessionActionMenuTriggerRect, setSessionActionMenuTriggerRect] = useState<DOMRect | null>(null);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState<boolean>(false);
   const [showModelSelect, setShowModelSelect] = useState<boolean>(false);
   const [availableModels, setAvailableModels] = useState<OpenCodeProviderModel[]>([]);
   const [selectedModelIndex, setSelectedModelIndex] = useState<number>(0);
@@ -44,11 +48,13 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
   const [modelError, setModelError] = useState<string | null>(null);
   const [isCreatingSession, setIsCreatingSession] = useState<boolean>(false);
   const [sessionCreateError, setSessionCreateError] = useState<string | null>(null);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const lastSelectedModelIndexRef = useRef<number>(0);
   const modelListRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const lastHandledSpeechResultRef = useRef<string | null>(null);
+  const prevSessionIDRef = useRef<string | null>(null);
 
   const speech = useSpeechRecognition({ gatewayUrl, gatewayToken });
 
@@ -71,6 +77,8 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
 
   const activeSession = selectedSession;
 
+  const [selectedOptions, setSelectedOptions] = useState<Set<string>>(new Set());
+
   const canGoBack = showSessionList ? false : !!selectedSessionID;
 
   const hasFetchedSessionsRef = useRef<boolean>(false);
@@ -89,8 +97,20 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
   }, [gatewayUrl, gatewayToken, connected, actions]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages.length]);
+    if (showSessionList || !selectedSessionID) {
+      prevSessionIDRef.current = null;
+      return;
+    }
+
+    const sessionChanged = selectedSessionID !== prevSessionIDRef.current;
+    prevSessionIDRef.current = selectedSessionID;
+
+    if (sessionChanged) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'instant' });
+    } else if (messages.length > 0) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [messages, selectedSessionID, showSessionList]);
 
   useEffect(() => {
     if (speech.state === 'completed' && speech.result) {
@@ -253,37 +273,107 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
     }
   });
 
-  const handleArchiveSession = async (sessionID: string) => {
-    if (operatingSessionId) return;
-    setOperatingSessionId(sessionID);
-    await actions.archiveSession(sessionID);
-    setOperatingSessionId(null);
+  const handleToggleSessionSelection = (sessionID: string) => {
+    setSelectedSessionIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(sessionID)) {
+        next.delete(sessionID);
+      } else {
+        next.add(sessionID);
+      }
+      return next;
+    });
   };
 
-  const handleRestoreSession = async (sessionID: string) => {
-    if (operatingSessionId) return;
-    setOperatingSessionId(sessionID);
-    await actions.restoreSession(sessionID);
-    setOperatingSessionId(null);
+  const handleOpenSessionActionMenu = (event: React.MouseEvent) => {
+    event.stopPropagation();
+    setSessionActionMenuTriggerRect((event.currentTarget as HTMLElement).getBoundingClientRect());
+    setShowSessionActionMenu(true);
   };
 
-  const handleDeleteSession = async (sessionID: string) => {
-    if (operatingSessionId) return;
-    setOperatingSessionId(sessionID);
-    setDeleteConfirmId(null);
-    await actions.deleteSession(sessionID);
-    setOperatingSessionId(null);
+  const handleCloseSessionActionMenu = () => {
+    setShowSessionActionMenu(false);
+    setSessionActionMenuTriggerRect(null);
+  };
+
+  const handleSelectedSessionOperation = async (
+    operation: (sessionID: string) => Promise<unknown>,
+  ) => {
+    const sessionIDs = Array.from(selectedSessionIds);
+    if (sessionIDs.length === 0 || operatingSessionId) return;
+    setOperatingSessionId('batch');
+    try {
+      for (const sessionID of sessionIDs) {
+        await operation(sessionID);
+      }
+      setSelectedSessionIds(new Set());
+    } finally {
+      setOperatingSessionId(null);
+    }
+  };
+
+  const handleSelectedSessionDelete = async () => {
+    const sessionIDs = Array.from(selectedSessionIds);
+    if (sessionIDs.length === 0 || operatingSessionId) return;
+    setShowDeleteConfirm(false);
+    setOperatingSessionId('batch');
+    try {
+      for (const sessionID of sessionIDs) {
+        await actions.deleteSession(sessionID);
+      }
+      setSelectedSessionIds(new Set());
+    } finally {
+      setOperatingSessionId(null);
+    }
   };
 
   const handleToggleArchived = () => {
     setShowArchivedSessions((prev) => {
       const next = !prev;
+      setSelectedSessionIds(new Set());
       if (next) {
         actions.refreshArchivedSessions();
       }
       return next;
     });
   };
+
+  const selectedSessionCount = selectedSessionIds.size;
+  const sessionActionMenuItems: ContextActionMenuItem[] = showArchivedSessions
+    ? [
+        {
+          label: 'アーカイブから復帰',
+          disabled: selectedSessionCount === 0 || !!operatingSessionId,
+          onClick: () => handleSelectedSessionOperation(actions.restoreSession),
+        },
+        {
+          label: '削除',
+          disabled: selectedSessionCount === 0 || !!operatingSessionId,
+          onClick: () => setShowDeleteConfirm(true),
+        },
+      ]
+    : [
+        {
+          label: 'アーカイブ',
+          disabled: selectedSessionCount === 0 || !!operatingSessionId,
+          onClick: () => handleSelectedSessionOperation(actions.archiveSession),
+        },
+        {
+          label: '削除',
+          disabled: selectedSessionCount === 0 || !!operatingSessionId,
+          onClick: () => setShowDeleteConfirm(true),
+        },
+      ];
+
+  const handleCopyMessage = useCallback(async (msgId: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedMessageId(msgId);
+      setTimeout(() => setCopiedMessageId(null), 2000);
+    } catch {
+      // Silently fail - clipboard API may not be available
+    }
+  }, []);
 
   const formatSessionTitle = (session: OpenCodeSessionInfo): string => {
     if (session.title && session.title.trim()) {
@@ -328,13 +418,24 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
 
   const renderPermissionDialog = () => {
     if (pendingPermissions.length === 0) return null;
-    const perm = pendingPermissions[0];
+    const sessionPermissions = selectedSessionID
+      ? pendingPermissions.filter((p) => p.sessionID === selectedSessionID)
+      : [];
+    if (sessionPermissions.length === 0) return null;
+    const perm = sessionPermissions[0];
+    console.log('[Permission] dialog show', {
+      id: perm.id,
+      sessionID: perm.sessionID,
+      permission: perm.permission,
+      patterns: perm.patterns,
+      always: perm.always,
+    });
     return (
       <div className="oc-dialog-overlay">
         <div className="oc-dialog">
           <div className="oc-dialog-header">
             <AlertCircle size={18} />
-            <span>Permission Required</span>
+            <span>権限の確認</span>
           </div>
           <div className="oc-dialog-body">
             <div className="oc-dialog-permission-type">{perm.permission}</div>
@@ -347,12 +448,15 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
             )}
             {perm.metadata && (
               <div className="oc-dialog-metadata">
-                {Object.entries(perm.metadata).map(([key, value]) => (
-                  <div key={key} className="oc-dialog-metadata-item">
-                    <span className="oc-dialog-metadata-key">{key}:</span>
-                    <span className="oc-dialog-metadata-value">{String(value)}</span>
-                  </div>
-                ))}
+                {Object.entries(perm.metadata).map(([key, value]) => {
+                  const metadataLabelMap: Record<string, string> = { filepath: 'ファイル', parentDir: '親フォルダ' };
+                  return (
+                    <div key={key} className="oc-dialog-metadata-item">
+                      <span className="oc-dialog-metadata-key">{metadataLabelMap[key] || key}:</span>
+                      <span className="oc-dialog-metadata-value">{String(value)}</span>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -361,20 +465,20 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
               className="oc-btn oc-btn-deny"
               onClick={() => actions.respondPermission(perm.id, 'deny')}
             >
-              Deny
+              拒否
             </button>
             <button
               className="oc-btn oc-btn-grant"
               onClick={() => actions.respondPermission(perm.id, 'grant')}
             >
-              Allow
+              一度だけ許可
             </button>
             {perm.always && perm.always.length > 0 && (
               <button
                 className="oc-btn oc-btn-always"
                 onClick={() => actions.respondPermission(perm.id, 'always')}
               >
-                Always Allow
+                常に許可
               </button>
             )}
           </div>
@@ -383,44 +487,140 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
     );
   };
 
+  const questionInputRef = useRef<HTMLInputElement>(null);
+
   const renderQuestionDialog = () => {
     if (pendingQuestions.length === 0) return null;
-    const q = pendingQuestions[0];
-    const handleAnswer = (answer: string | string[]) => {
+    const sessionQuestions = selectedSessionID
+      ? pendingQuestions.filter((q) => q.sessionID === selectedSessionID)
+      : [];
+    if (sessionQuestions.length === 0) return null;
+    const q = sessionQuestions[0];
+    const isMultiple = q.multiple === true;
+    const hasOptions = q.options && q.options.length > 0;
+    const showFreeInput = !hasOptions || q.custom !== false;
+
+    const handleSingleAnswer = (answer: string) => {
+      setSelectedOptions(new Set());
       actions.respondQuestion(q.id, answer);
     };
+
+    const handleMultipleSubmit = () => {
+      const selected = Array.from(selectedOptions);
+      const customText = questionInputRef.current?.value.trim() || '';
+      const answer = customText ? [...selected, customText] : selected;
+      setSelectedOptions(new Set());
+      if (questionInputRef.current) questionInputRef.current.value = '';
+      actions.respondQuestion(q.id, answer);
+    };
+
+    const handleSkip = () => {
+      setSelectedOptions(new Set());
+      if (questionInputRef.current) questionInputRef.current.value = '';
+      actions.respondQuestion(q.id, '');
+    };
+
+    const toggleOption = (label: string) => {
+      setSelectedOptions((prev) => {
+        const next = new Set(prev);
+        if (next.has(label)) {
+          next.delete(label);
+        } else {
+          next.add(label);
+        }
+        return next;
+      });
+    };
+
+    if (isMultiple) {
+      return (
+        <div className="oc-dialog-overlay" key={q.id}>
+          <div className="oc-dialog">
+            <div className="oc-dialog-header">
+              <AlertCircle size={18} />
+              <span>{q.header || '質問'}</span>
+            </div>
+            <div className="oc-dialog-body">
+              {q.question && <div className="oc-dialog-question-text">{q.question}</div>}
+              {hasOptions && (
+                <div className="oc-dialog-options">
+                  {q.options!.map((opt, i) => (
+                    <button
+                      key={i}
+                      className={`oc-btn oc-btn-option${selectedOptions.has(opt.label) ? ' oc-option-selected' : ''}`}
+                      onClick={() => toggleOption(opt.label)}
+                    >
+                      <div className="oc-option-label">
+                        <span className="oc-option-checkbox">{selectedOptions.has(opt.label) ? '☑' : '☐'}</span>
+                        {opt.label}
+                      </div>
+                      {opt.description && <div className="oc-option-desc">{opt.description}</div>}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {showFreeInput && (
+                <div className="oc-dialog-free-input">
+                  {hasOptions && <div className="oc-dialog-free-input-label">自由入力</div>}
+                  <input
+                    ref={questionInputRef}
+                    type="text"
+                    className="oc-input"
+                    placeholder="回答を入力..."
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleMultipleSubmit();
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+            <div className="oc-dialog-actions">
+              <button className="oc-btn oc-btn-grant" onClick={handleMultipleSubmit}>
+                回答する
+              </button>
+              <button className="oc-btn oc-btn-deny" onClick={handleSkip}>
+                スキップ
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     return (
-      <div className="oc-dialog-overlay">
+      <div className="oc-dialog-overlay" key={q.id}>
         <div className="oc-dialog">
           <div className="oc-dialog-header">
             <AlertCircle size={18} />
-            <span>{q.header || 'Question'}</span>
+              <span>{q.header || '質問'}</span>
           </div>
           <div className="oc-dialog-body">
-            <div className="oc-dialog-question-text">{q.question}</div>
-            {q.options && q.options.length > 0 && (
+            {q.question && <div className="oc-dialog-question-text">{q.question}</div>}
+            {hasOptions && (
               <div className="oc-dialog-options">
-                {q.options.map((opt, i) => (
+                {q.options!.map((opt, i) => (
                   <button
                     key={i}
                     className="oc-btn oc-btn-option"
-                    onClick={() => handleAnswer(opt.label)}
+                    onClick={() => handleSingleAnswer(opt.label)}
                   >
-                    {opt.label}
-                    {opt.description && <span className="oc-option-desc">{opt.description}</span>}
+                    <div className="oc-option-label">{opt.label}</div>
+                    {opt.description && <div className="oc-option-desc">{opt.description}</div>}
                   </button>
                 ))}
               </div>
             )}
-            {!q.options && (
+            {showFreeInput && (
               <div className="oc-dialog-free-input">
+                {hasOptions && <div className="oc-dialog-free-input-label">自由入力</div>}
                 <input
+                  ref={questionInputRef}
                   type="text"
                   className="oc-input"
                   placeholder="回答を入力..."
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && (e.target as HTMLInputElement).value.trim()) {
-                      handleAnswer((e.target as HTMLInputElement).value.trim());
+                      handleSingleAnswer((e.target as HTMLInputElement).value.trim());
                     }
                   }}
                 />
@@ -428,11 +628,20 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
             )}
           </div>
           <div className="oc-dialog-actions">
-            <button
-              className="oc-btn oc-btn-deny"
-              onClick={() => handleAnswer('')}
-            >
-              Skip
+            {showFreeInput && (
+              <button
+                className="oc-btn oc-btn-grant"
+                onClick={() => {
+                  if (questionInputRef.current && questionInputRef.current.value.trim()) {
+                    handleSingleAnswer(questionInputRef.current.value.trim());
+                  }
+                }}
+              >
+                回答
+              </button>
+            )}
+            <button className="oc-btn oc-btn-deny" onClick={handleSkip}>
+              スキップ
             </button>
           </div>
         </div>
@@ -532,6 +741,7 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
           showSettingsButton={showSettingsButton}
           showSwapButton={showSwapButton}
           onSwapPanes={onSwapPanes}
+          onOpenActionMenu={handleOpenSessionActionMenu}
         />
         {error && (
           <div className="oc-error-banner">
@@ -559,44 +769,30 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
                 {isLoadingArchivedSessions && archivedSessions.length === 0 && (
                   <div className="oc-loading">Loading archived sessions...</div>
                 )}
-                {archivedSessions.map((session) => (
-                  <div key={session.id} className="agent-session-item-wrapper">
-                    <button
-                      className={`agent-session-item ${session.id === selectedSessionID ? 'active' : ''}`}
-                      onClick={() => handleSelectSession(session.id)}
-                      disabled={operatingSessionId === session.id}
-                    >
-                      <span className="agent-session-title">
-                        {formatSessionTitle(session)}
-                      </span>
-                      <span className="agent-session-date">
-                        {formatTime(session.time?.updated)}
-                      </span>
-                    </button>
-                    <div className="agent-session-actions">
+                {archivedSessions.map((session) => {
+                  const isSelected = selectedSessionIds.has(session.id);
+                  return (
+                    <div key={session.id} className={`agent-session-item-wrapper ${isSelected ? 'selected' : ''}`}>
                       <button
-                        className="agent-session-action-btn"
-                        onClick={() => handleRestoreSession(session.id)}
+                        className={`agent-session-item ${session.id === selectedSessionID ? 'active' : ''}`}
+                        onClick={() => handleSelectSession(session.id)}
                         disabled={operatingSessionId === session.id}
-                        title="Restore from archive"
                       >
-                        {operatingSessionId === session.id ? (
-                          <Loader2 size={13} className="oc-spinning" />
-                        ) : (
-                          <ArchiveRestore size={13} />
-                        )}
+                        <span className="agent-session-title">
+                          {formatSessionTitle(session)}
+                        </span>
+                        <span className="agent-session-date">
+                          {formatTime(session.time?.updated)}
+                        </span>
                       </button>
-                      <button
-                        className="agent-session-action-btn agent-session-action-btn--danger"
-                        onClick={() => setDeleteConfirmId(session.id)}
-                        disabled={operatingSessionId === session.id}
-                        title="Delete session"
-                      >
-                        <Trash2 size={13} />
+                      <button className="agent-session-select" onClick={() => handleToggleSessionSelection(session.id)} disabled={!!operatingSessionId} title="セッションを選択" aria-label="セッションを選択">
+                        <span className={`file-select-checkbox ${isSelected ? 'checked' : ''}`}>
+                          {isSelected && <Check size={14} />}
+                        </span>
                       </button>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
                 {archivedSessions.length === 0 && !isLoadingArchivedSessions && (
                   <div className="agent-session-empty">
                     No archived sessions.
@@ -608,50 +804,36 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
                 {isLoadingSessions && sessions.length === 0 && (
                   <div className="oc-loading">Loading sessions...</div>
                 )}
-                {sessions.map((session) => (
-                  <div key={session.id} className="agent-session-item-wrapper">
-                    <button
-                      className={`agent-session-item ${session.id === selectedSessionID ? 'active' : ''}`}
-                      onClick={() => handleSelectSession(session.id)}
-                      disabled={operatingSessionId === session.id}
-                    >
-                      <span className="agent-session-title">
-                        {unreadSessionIds.includes(session.id) && (
-                          <span className="agent-session-unread" />
-                        )}
-                        {processingSessionIds.includes(session.id) && (
-                          <span className="agent-session-processing" />
-                        )}
-                        {formatSessionTitle(session)}
-                      </span>
-                      <span className="agent-session-date">
-                        {formatTime(session.time?.updated)}
-                      </span>
-                    </button>
-                    <div className="agent-session-actions">
+                {sessions.map((session) => {
+                  const isSelected = selectedSessionIds.has(session.id);
+                  return (
+                    <div key={session.id} className={`agent-session-item-wrapper ${isSelected ? 'selected' : ''}`}>
                       <button
-                        className="agent-session-action-btn"
-                        onClick={() => handleArchiveSession(session.id)}
+                        className={`agent-session-item ${session.id === selectedSessionID ? 'active' : ''}`}
+                        onClick={() => handleSelectSession(session.id)}
                         disabled={operatingSessionId === session.id}
-                        title="Archive session"
                       >
-                        {operatingSessionId === session.id ? (
-                          <Loader2 size={13} className="oc-spinning" />
-                        ) : (
-                          <Archive size={13} />
-                        )}
+                        <span className="agent-session-title">
+                          {unreadSessionIds.includes(session.id) && (
+                            <span className="agent-session-unread" />
+                          )}
+                          {processingSessionIds.includes(session.id) && (
+                            <span className="agent-session-processing" />
+                          )}
+                          {formatSessionTitle(session)}
+                        </span>
+                        <span className="agent-session-date">
+                          {formatTime(session.time?.updated)}
+                        </span>
                       </button>
-                      <button
-                        className="agent-session-action-btn agent-session-action-btn--danger"
-                        onClick={() => setDeleteConfirmId(session.id)}
-                        disabled={operatingSessionId === session.id}
-                        title="Delete session"
-                      >
-                        <Trash2 size={13} />
+                      <button className="agent-session-select" onClick={() => handleToggleSessionSelection(session.id)} disabled={!!operatingSessionId} title="セッションを選択" aria-label="セッションを選択">
+                        <span className={`file-select-checkbox ${isSelected ? 'checked' : ''}`}>
+                          {isSelected && <Check size={14} />}
+                        </span>
                       </button>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
                 {sessions.length === 0 && !isLoadingSessions && (
                   <div className="agent-session-empty">
                     No sessions yet. Create one to get started.
@@ -661,8 +843,8 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
             )}
           </div>
         </div>
-        {deleteConfirmId && (
-          <div className="oc-dialog-overlay" onClick={() => setDeleteConfirmId(null)}>
+        {showDeleteConfirm && (
+          <div className="oc-dialog-overlay" onClick={() => setShowDeleteConfirm(false)}>
             <div className="oc-dialog" onClick={(e) => e.stopPropagation()}>
               <div className="oc-dialog-header">
                 <AlertCircle size={18} />
@@ -674,13 +856,13 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
               <div className="oc-dialog-actions">
                 <button
                   className="oc-btn"
-                  onClick={() => setDeleteConfirmId(null)}
+                  onClick={() => setShowDeleteConfirm(false)}
                 >
                   Cancel
                 </button>
                 <button
                   className="oc-btn oc-btn-deny"
-                  onClick={() => handleDeleteSession(deleteConfirmId)}
+                  onClick={handleSelectedSessionDelete}
                 >
                   Delete
                 </button>
@@ -688,6 +870,12 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
             </div>
           </div>
         )}
+        <ContextActionMenu
+          isOpen={showSessionActionMenu}
+          items={sessionActionMenuItems}
+          onClose={handleCloseSessionActionMenu}
+          triggerRect={sessionActionMenuTriggerRect}
+        />
         {showModelSelect && (
           <div className="oc-dialog-overlay" onClick={handleModelSelectCancel}>
             <div className="oc-dialog oc-dialog-model-select" onClick={(e) => e.stopPropagation()}>
@@ -799,10 +987,10 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
         showSwapButton={showSwapButton}
         onSwapPanes={onSwapPanes}
       />
-      <div className="oc-session-header">
+      {/* <div className="oc-session-header">
         <div className="oc-session-header-right">
         </div>
-      </div>
+      </div> */}
       {error && (
         <div className="oc-error-banner">
           <AlertCircle size={14} />
@@ -839,11 +1027,26 @@ export const AgentScreen: React.FC<AgentScreenProps> = ({
                 <div className="agent-message-content">
                   {renderMessageContent(msg)}
                 </div>
-                {(createdTime || (isAssistant && durationMs !== undefined)) && (
-                  <div className="agent-message-timestamp">
-                    {createdTime && formatDateTime(createdTime)}
-                    {isAssistant && durationMs !== undefined && createdTime && (
-                      <span className="agent-message-duration"> · {formatDuration(durationMs)}</span>
+                {(createdTime || (isAssistant && durationMs !== undefined) || (msg.contentText && !msg.id.startsWith('temp-assistant-'))) && (
+                  <div className="agent-message-footer">
+                    <div className="agent-message-timestamp">
+                      {createdTime && formatDateTime(createdTime)}
+                      {isAssistant && durationMs !== undefined && createdTime && (
+                        <span className="agent-message-duration"> · {formatDuration(durationMs)}</span>
+                      )}
+                    </div>
+                    {msg.contentText && !msg.id.startsWith('temp-assistant-') && (
+                      <button
+                        className="agent-message-copy-btn"
+                        onClick={() => handleCopyMessage(msg.id, msg.contentText)}
+                        title="Copy message"
+                      >
+                        {copiedMessageId === msg.id ? (
+                          <Check size={13} />
+                        ) : (
+                          <Copy size={13} />
+                        )}
+                      </button>
                     )}
                   </div>
                 )}

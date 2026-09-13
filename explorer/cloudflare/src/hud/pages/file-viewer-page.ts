@@ -2,10 +2,65 @@ import { TextContainerProperty } from "@evenrealities/even_hub_sdk";
 import { BasePage, PageRenderResult } from "../page-manager";
 import { FileSystemItem } from "../../domain/types";
 import { FileSystemService } from "../../services/FileSystemService";
+import { GatewayFileSystemService } from "../../services/GatewayFileSystemService";
+import { loadAutoScrollSettings } from "../../services/AutoScrollSettings";
+import { getG2SharedPosition, saveG2SharedPosition } from "../services/g2-shared-position-store";
+import { addG2ToHistory } from "../services/g2-viewer-history-store";
 
 export const G2_VIEWER_LINES = 9;
 export const G2_VIEWER_MAX_WIDTH = 56;
 const VIEWER_SCROLL_STEP = 8;
+
+/**
+ * Compute G2 scroll position from a shared progress value,
+ * correcting for the viewport size difference between PWA and G2.
+ *
+ * PWA saves progress relative to its own viewport (typically 30-60+ lines).
+ * G2 has only 9 visible lines. Without correction, the same progress
+ * places G2 significantly ahead of where PWA was viewing.
+ *
+ * Correction is bounded (not proportional to file length) to avoid
+ * over-correction on long files. Two components:
+ *
+ * 1. Viewport correction: G2 shows 9 lines, PWA shows ~30-60 lines.
+ *    We subtract 2×G2_VIEWER_LINES (18 lines) from the denominator,
+ *    which approximates the typical viewport difference.
+ *
+ * 2. Wrapping correction: G2 wraps at 56 chars, PWA at browser width.
+ *    If G2 wraps more, wrappedLines.length > lines.length.
+ *    We add a bounded correction based on the wrapping ratio,
+ *    capped to prevent runaway correction on very long files.
+ */
+function computeG2RestorePosition(
+  savedProgress: number,
+  wrappedLinesCount: number,
+  viewerLines: number,
+  logicalLineCount: number,
+): number {
+  const totalLines = wrappedLinesCount;
+
+  // Viewport correction: 2 screens worth of G2 lines.
+  // This accounts for PWA's larger viewport without scaling with file length.
+  const viewportCorrection = viewerLines * 2;
+
+  // Wrapping correction: bounded, based on how much G2 wraps beyond 1.2×.
+  // wrappedLinesCount / logicalLineCount = wrapping ratio.
+  // If G2 wraps 50% more (ratio=1.5), correction = (1.5-1.2) × 30 = 9 lines.
+  // Capped at viewerLines × 3 = 27 lines max.
+  const wrappingRatio = logicalLineCount > 0
+    ? wrappedLinesCount / logicalLineCount
+    : 1;
+  const wrappingCorrection = Math.min(
+    viewerLines * 3,
+    Math.max(0, Math.round((wrappingRatio - 1.2) * 30)),
+  );
+
+  const maxPosition = Math.max(
+    0,
+    totalLines - viewerLines - viewportCorrection - wrappingCorrection,
+  );
+  return Math.round(savedProgress * maxPosition);
+}
 
 interface WrappedLine {
   text: string;
@@ -16,7 +71,9 @@ interface WrappedLine {
 export class FileViewerPage extends BasePage {
   private file: FileSystemItem;
   private fileService: FileSystemService;
+  private gatewayService: GatewayFileSystemService | null;
   private onBackToExplorer: () => Promise<boolean>;
+  private onNavigateToHistory?: () => Promise<void>;
   private onStateChange?: (file: FileSystemItem, content: string) => void;
   private onAgentSessionList?: () => Promise<void>;
   private content: string = "";
@@ -25,20 +82,42 @@ export class FileViewerPage extends BasePage {
   private scrollPosition: number = 0;
   private scrollInverted: boolean = false;
 
+  // Debounced shared position save (prevents excessive Gateway PATCH on every scroll)
+  private positionSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingPositionSave: { progress: number } | null = null;
+  private static readonly POSITION_SAVE_DEBOUNCE_MS = 2000;
+
+  // Auto Scroll state (elapsed-time based, DocsReader4EH pattern)
+  private autoScrollEnabled: boolean = false;
+  private autoScrollRemainingMs: number = 0;
+  private autoScrollLastTickTime: number = 0;
+  private autoScrollIndicator: string | null = null;
+  private autoScrollIndicatorTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * PageManager checks this on navigateTo() and on each onAutoTickChanged
+   * callback to decide whether to start/stop the shared ~400ms interval.
+   */
+  public get isAutoTickNeeded(): boolean { return this.autoScrollEnabled; }
+
   constructor(
     file: FileSystemItem,
     fileService: FileSystemService,
     onBackToExplorer: () => Promise<boolean>,
     onStateChange?: (file: FileSystemItem, content: string) => void,
     onAgentSessionList?: () => Promise<void>,
+    gatewayService?: GatewayFileSystemService | null,
+    onNavigateToHistory?: () => Promise<void>,
   ) {
     super();
     this.pageType = "FileViewerPage";
     this.file = file;
     this.fileService = fileService;
+    this.gatewayService = gatewayService ?? null;
     this.onBackToExplorer = onBackToExplorer;
     this.onStateChange = onStateChange;
     this.onAgentSessionList = onAgentSessionList;
+    this.onNavigateToHistory = onNavigateToHistory;
   }
 
   public getCurrentPath(): string {
@@ -66,8 +145,30 @@ export class FileViewerPage extends BasePage {
       this.notifyStatus(`Reading ${this.file.name}...`);
       this.content = await this.fileService.readFile(this.file.path);
       this.lines = this.content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-      this.scrollPosition = 0;
       this.buildWrappedLines();
+
+      // Try shared position (Gateway) — no localStorage fallback
+      let savedProgress: number | null = null;
+      if (this.gatewayService) {
+        try {
+          savedProgress = await getG2SharedPosition(this.gatewayService, this.file.path);
+        } catch {
+          // Gateway unavailable — start from top
+        }
+        // Add to viewing history (fire-and-forget, non-blocking)
+        addG2ToHistory(this.gatewayService, this.file.path).catch(() => {});
+      }
+
+      if (savedProgress !== null && savedProgress >= 0 && savedProgress <= 1) {
+        this.scrollPosition = computeG2RestorePosition(
+          savedProgress,
+          this.wrappedLines.length,
+          G2_VIEWER_LINES,
+          this.lines.length,
+        );
+      } else {
+        this.scrollPosition = 0;
+      }
       this.notifyStatus(`Loaded ${this.lines.length} lines`);
       if (this.renderPage) {
         await this.renderPage();
@@ -88,6 +189,49 @@ export class FileViewerPage extends BasePage {
   private notifyState() {
     if (this.onStateChange) {
       this.onStateChange(this.file, this.content);
+    }
+  }
+
+  /**
+   * Save reading position as scroll progress (0.0 ~ 1.0) to Gateway (debounced).
+   * Gateway PATCH is coalesced: rapid scrolls only trigger one HTTP call
+   * after 2s of inactivity. Immediate save on deactivate/top/bottom.
+   */
+  private saveCurrentPosition(): void {
+    const maxPosition = Math.max(0, this.wrappedLines.length - G2_VIEWER_LINES);
+    const progress = maxPosition > 0
+      ? Math.min(1, Math.max(0, this.scrollPosition / maxPosition))
+      : 0;
+
+    // Gateway shared position — debounced
+    if (this.gatewayService) {
+      this.pendingPositionSave = { progress };
+      if (this.positionSaveTimer === null) {
+        this.positionSaveTimer = setTimeout(() => {
+          this.positionSaveTimer = null;
+          if (this.pendingPositionSave && this.gatewayService) {
+            const { progress: p } = this.pendingPositionSave;
+            this.pendingPositionSave = null;
+            saveG2SharedPosition(this.gatewayService, this.file.path, p);
+          }
+        }, FileViewerPage.POSITION_SAVE_DEBOUNCE_MS);
+      }
+    }
+  }
+
+  /**
+   * Flush any pending debounced position save immediately.
+   * Called from onDeactivate and explicit save points (top/bottom/refresh).
+   */
+  private flushPositionSave(): void {
+    if (this.positionSaveTimer !== null) {
+      clearTimeout(this.positionSaveTimer);
+      this.positionSaveTimer = null;
+    }
+    if (this.pendingPositionSave && this.gatewayService) {
+      const { progress } = this.pendingPositionSave;
+      this.pendingPositionSave = null;
+      saveG2SharedPosition(this.gatewayService, this.file.path, progress);
     }
   }
 
@@ -195,7 +339,10 @@ export class FileViewerPage extends BasePage {
   public render(): PageRenderResult {
     const range = this.getVisibleLogicalRange();
     const scrollMode = this.scrollInverted ? 's' : 'k';
-    const pageIndicator = `[${range.min}-${range.max}/${range.total}]${scrollMode}`;
+    let pageIndicator = `[${range.min}-${range.max}/${range.total}]${scrollMode}`;
+    if (this.autoScrollIndicator) {
+      pageIndicator += ` ${this.autoScrollIndicator}`;
+    }
     const headerContent = this.buildHeaderLine(this.file.path, pageIndicator, G2_VIEWER_MAX_WIDTH, "[Viewer]");
 
     const end = Math.min(this.scrollPosition + G2_VIEWER_LINES, this.wrappedLines.length);
@@ -234,6 +381,7 @@ export class FileViewerPage extends BasePage {
       textObject: [headerProp, bodyProp],
       menuObject: {
         menuList: [
+          { id: "history", title: "閲覧履歴画面へ" },
           { id: "agent", title: "エージェント画面へ" },
           { id: "refresh", title: "更新" },
           { id: "top", title: "先頭へ" },
@@ -244,9 +392,91 @@ export class FileViewerPage extends BasePage {
     };
   }
 
+  // ── Auto Scroll (elapsed-time based, DocsReader4EH pattern) ──
+
+  private clearAutoScrollIndicatorTimer(): void {
+    if (this.autoScrollIndicatorTimer !== null) {
+      clearTimeout(this.autoScrollIndicatorTimer);
+      this.autoScrollIndicatorTimer = null;
+    }
+  }
+
+  private isAtEnd(): boolean {
+    return this.scrollPosition >= Math.max(0, this.wrappedLines.length - G2_VIEWER_LINES);
+  }
+
   /**
-   * Scroll up by visual lines.
+   * Called by PageManager's shared ~400ms interval tick.
+   * Uses Date.now() elapsed time to determine when to scroll —
+   * no setTimeout chain, reliable on G2 Runtime.
    */
+  public onAutoTick(): void {
+    if (!this.autoScrollEnabled || !this.isActive) return;
+
+    const now = Date.now();
+    const elapsed = now - this.autoScrollLastTickTime;
+    this.autoScrollLastTickTime = now;
+
+    this.autoScrollRemainingMs -= elapsed;
+
+    if (this.autoScrollRemainingMs <= 0) {
+      // Time to scroll
+      if (this.isAtEnd()) {
+        this.stopAutoScroll();
+        return;
+      }
+
+      const maxPosition = Math.max(0, this.wrappedLines.length - G2_VIEWER_LINES);
+      this.scrollPosition = Math.min(this.scrollPosition + VIEWER_SCROLL_STEP, maxPosition);
+      this.saveCurrentPosition();
+
+      // Reset countdown for next scroll
+      const settings = loadAutoScrollSettings();
+      this.autoScrollRemainingMs = settings.interval * 1000;
+      this.autoScrollLastTickTime = Date.now();
+    }
+
+    // Update countdown indicator
+    const remainingSeconds = Math.ceil(Math.max(0, this.autoScrollRemainingMs) / 1000);
+    this.autoScrollIndicator = String(remainingSeconds);
+    if (this.renderPage) this.renderPage();
+  }
+
+  private stopAutoScroll(): void {
+    this.autoScrollEnabled = false;
+    this.autoScrollRemainingMs = 0;
+    this.autoScrollLastTickTime = 0;
+    this.autoScrollIndicator = null;
+    this.onAutoTickChanged?.();
+    if (this.renderPage) this.renderPage();
+    console.log(`[G2 AutoScroll] STOPPED`);
+  }
+
+  private toggleAutoScroll(): void {
+    if (this.autoScrollEnabled) {
+      this.stopAutoScroll();
+    } else {
+      this.autoScrollEnabled = true;
+      const settings = loadAutoScrollSettings();
+      this.autoScrollRemainingMs = settings.interval * 1000;
+      this.autoScrollLastTickTime = Date.now();
+      this.autoScrollIndicator = String(settings.interval);
+      this.onAutoTickChanged?.();
+      if (this.renderPage) this.renderPage();
+      console.log(`[G2 AutoScroll] STARTED interval=${settings.interval}s`);
+    }
+  }
+
+  private resetAutoScrollTimer(): void {
+    if (this.autoScrollEnabled) {
+      const settings = loadAutoScrollSettings();
+      this.autoScrollRemainingMs = settings.interval * 1000;
+      this.autoScrollLastTickTime = Date.now();
+    }
+  }
+
+  // ── Scroll Handlers ────────────────────────────────────────
+
   public async onScrollUp() {
     if (this.scrollInverted) {
       if (this.scrollPosition < this.wrappedLines.length - G2_VIEWER_LINES) {
@@ -254,11 +484,15 @@ export class FileViewerPage extends BasePage {
           this.scrollPosition + VIEWER_SCROLL_STEP,
           Math.max(0, this.wrappedLines.length - G2_VIEWER_LINES),
         );
+        this.saveCurrentPosition();
+        this.resetAutoScrollTimer();
         if (this.renderPage) await this.renderPage();
       }
     } else {
       if (this.scrollPosition > 0) {
         this.scrollPosition = Math.max(this.scrollPosition - VIEWER_SCROLL_STEP, 0);
+        this.saveCurrentPosition();
+        this.resetAutoScrollTimer();
         if (this.renderPage) await this.renderPage();
       }
     }
@@ -271,6 +505,8 @@ export class FileViewerPage extends BasePage {
     if (this.scrollInverted) {
       if (this.scrollPosition > 0) {
         this.scrollPosition = Math.max(this.scrollPosition - VIEWER_SCROLL_STEP, 0);
+        this.saveCurrentPosition();
+        this.resetAutoScrollTimer();
         if (this.renderPage) await this.renderPage();
       }
     } else {
@@ -279,6 +515,8 @@ export class FileViewerPage extends BasePage {
           this.scrollPosition + VIEWER_SCROLL_STEP,
           Math.max(0, this.wrappedLines.length - G2_VIEWER_LINES),
         );
+        this.saveCurrentPosition();
+        this.resetAutoScrollTimer();
         if (this.renderPage) await this.renderPage();
       }
     }
@@ -288,26 +526,47 @@ export class FileViewerPage extends BasePage {
     await this.onBackToExplorer();
   }
 
+  public async onClick() {
+    this.toggleAutoScroll();
+  }
+
+  public onDeactivate() {
+    super.onDeactivate();
+    this.stopAutoScroll();
+    this.clearAutoScrollIndicatorTimer();
+    this.autoScrollIndicator = null;
+    // Flush any pending debounced position save before leaving
+    this.flushPositionSave();
+  }
+
   public async onLongPress() {
     // G2-2: Long Press is reserved for future Voice Input
   }
 
   public async onMenuItemClick(menuId: string) {
     switch (menuId) {
+      case "history":
+        if (this.onNavigateToHistory) {
+          await this.onNavigateToHistory();
+        }
+        break;
       case "agent":
         if (this.onAgentSessionList) {
           await this.onAgentSessionList();
         }
         break;
       case "refresh":
+        this.flushPositionSave();
         await this.loadFileContent();
         break;
       case "top":
         this.scrollPosition = 0;
+        this.flushPositionSave();
         if (this.renderPage) await this.renderPage();
         break;
       case "bottom":
         this.scrollPosition = Math.max(0, this.wrappedLines.length - G2_VIEWER_LINES);
+        this.flushPositionSave();
         if (this.renderPage) await this.renderPage();
         break;
       case "scrollInvert":

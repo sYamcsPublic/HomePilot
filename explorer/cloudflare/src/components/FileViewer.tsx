@@ -1,17 +1,238 @@
-import React from 'react';
+import React, { useRef, useEffect, useCallback, useState } from 'react';
+import { loadAutoScrollSettings } from '../services/AutoScrollSettings';
+import { getSharedPosition, saveSharedPosition } from '../services/SharedPositionStore';
+import { GatewayFileSystemService } from '../services/GatewayFileSystemService';
+
+function computeScrollProgress(el: HTMLDivElement): number {
+  const maxScroll = el.scrollHeight - el.clientHeight;
+  return maxScroll > 0 ? Math.min(1, Math.max(0, el.scrollTop / maxScroll)) : 0;
+}
 
 interface FileViewerProps {
   content: string;
+  filePath?: string;
+  gatewayService?: GatewayFileSystemService | null;
 }
 
 export const FileViewer: React.FC<FileViewerProps> = ({
   content,
+  filePath,
+  gatewayService,
 }) => {
+  const viewerRef = useRef<HTMLDivElement>(null);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const positionRestoredRef = useRef(false);
+
+  // Auto Scroll state
+  const autoScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoScrollEnabledRef = useRef(false);
+  const isAutoScrollingRef = useRef(false);
+  const autoScrollNextScrollTimeRef = useRef<number>(0);
+  const [indicatorText, setIndicatorText] = useState<string | null>(null);
+  const autoScrollIndicatorIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── Reading Position Save ──────────────────────────────────
+
+  const savePosition = useCallback(() => {
+    if (!filePath || !viewerRef.current) return;
+    const el = viewerRef.current;
+    // Save scroll progress (0.0 ~ 1.0) to Gateway
+    if (gatewayService) {
+      const progress = computeScrollProgress(el);
+      saveSharedPosition(gatewayService, filePath, progress);
+    }
+  }, [filePath, gatewayService]);
+
+  const debouncedSave = useCallback(() => {
+    if (saveTimerRef.current !== null) {
+      clearTimeout(saveTimerRef.current);
+    }
+    saveTimerRef.current = setTimeout(() => {
+      saveTimerRef.current = null;
+      savePosition();
+    }, 400);
+  }, [savePosition]);
+
+  useEffect(() => {
+    positionRestoredRef.current = false;
+  }, [filePath, content]);
+
+  // ── Auto Scroll Logic ──────────────────────────────────────
+
+  const clearAutoScrollTimer = useCallback(() => {
+    if (autoScrollTimerRef.current !== null) {
+      clearTimeout(autoScrollTimerRef.current);
+      autoScrollTimerRef.current = null;
+    }
+  }, []);
+
+  const stopIndicatorInterval = useCallback(() => {
+    if (autoScrollIndicatorIntervalRef.current !== null) {
+      clearInterval(autoScrollIndicatorIntervalRef.current);
+      autoScrollIndicatorIntervalRef.current = null;
+    }
+  }, []);
+
+  const startIndicatorInterval = useCallback(() => {
+    stopIndicatorInterval();
+    autoScrollIndicatorIntervalRef.current = setInterval(() => {
+      if (!autoScrollEnabledRef.current) {
+        stopIndicatorInterval();
+        setIndicatorText(null);
+        return;
+      }
+      const remainingMs = autoScrollNextScrollTimeRef.current - Date.now();
+      if (remainingMs <= 0) {
+        setIndicatorText(null);
+        return;
+      }
+      const remainingSeconds = Math.ceil(remainingMs / 1000);
+      setIndicatorText(`${remainingSeconds} AUTO`);
+    }, 400);
+  }, [stopIndicatorInterval]);
+
+  const isAtEnd = useCallback((): boolean => {
+    const el = viewerRef.current;
+    if (!el) return true;
+    return el.scrollTop + el.clientHeight >= el.scrollHeight - 1;
+  }, []);
+
+  const stopAutoScroll = useCallback(() => {
+    autoScrollEnabledRef.current = false;
+    autoScrollNextScrollTimeRef.current = 0;
+    clearAutoScrollTimer();
+    stopIndicatorInterval();
+    setIndicatorText(null);
+  }, [clearAutoScrollTimer, stopIndicatorInterval]);
+
+  const scheduleNextAutoScroll = useCallback(() => {
+    clearAutoScrollTimer();
+    if (!autoScrollEnabledRef.current) return;
+
+    const settings = loadAutoScrollSettings();
+    autoScrollNextScrollTimeRef.current = Date.now() + settings.interval * 1000;
+    autoScrollTimerRef.current = setTimeout(() => {
+      autoScrollTimerRef.current = null;
+
+      if (!autoScrollEnabledRef.current) return;
+
+      const el = viewerRef.current;
+      if (!el) return;
+
+      if (isAtEnd()) {
+        stopAutoScroll();
+        return;
+      }
+
+      const viewHeight = el.clientHeight;
+      const currentSettings = loadAutoScrollSettings();
+      let amount: number;
+      switch (currentSettings.amount) {
+        case 'small':  amount = viewHeight * 0.25; break;
+        case 'large':  amount = viewHeight * 0.50; break;
+        default:       amount = viewHeight * 0.33; break;
+      }
+
+      isAutoScrollingRef.current = true;
+      el.scrollBy({ top: amount, behavior: 'smooth' });
+
+      // Release the flag after smooth scroll settles
+      setTimeout(() => {
+        isAutoScrollingRef.current = false;
+      }, 500);
+
+      scheduleNextAutoScroll();
+    }, settings.interval * 1000);
+  }, [clearAutoScrollTimer, isAtEnd, stopAutoScroll]);
+
+  const toggleAutoScroll = useCallback(() => {
+    if (autoScrollEnabledRef.current) {
+      stopAutoScroll();
+    } else {
+      autoScrollEnabledRef.current = true;
+      const settings = loadAutoScrollSettings();
+      autoScrollNextScrollTimeRef.current = Date.now() + settings.interval * 1000;
+      setIndicatorText(`${settings.interval} AUTO`);
+      startIndicatorInterval();
+      scheduleNextAutoScroll();
+    }
+  }, [stopAutoScroll, startIndicatorInterval, scheduleNextAutoScroll]);
+
+  // Scroll listener: save position + reset auto scroll timer on manual scroll
+  useEffect(() => {
+    const el = viewerRef.current;
+    if (!el) return;
+
+    const handleScroll = () => {
+      debouncedSave();
+      if (autoScrollEnabledRef.current && !isAutoScrollingRef.current) {
+        clearAutoScrollTimer();
+        scheduleNextAutoScroll();
+      }
+    };
+
+    el.addEventListener('scroll', handleScroll, { passive: true });
+    return () => {
+      el.removeEventListener('scroll', handleScroll);
+      if (saveTimerRef.current !== null) {
+        clearTimeout(saveTimerRef.current);
+      }
+    };
+  }, [debouncedSave, clearAutoScrollTimer, scheduleNextAutoScroll]);
+
+  // Restore reading position from shared position (Gateway only — no localStorage fallback)
+  useEffect(() => {
+    if (!filePath || positionRestoredRef.current) return;
+
+    const el = viewerRef.current;
+    if (!el) return;
+
+    const restore = async () => {
+      // Try shared position (Gateway)
+      if (gatewayService) {
+        try {
+          const sharedProgress = await getSharedPosition(gatewayService, filePath);
+          if (sharedProgress !== null && sharedProgress >= 0 && sharedProgress <= 1) {
+            requestAnimationFrame(() => {
+              const maxScroll = el.scrollHeight - el.clientHeight;
+              el.scrollTop = sharedProgress * maxScroll;
+              positionRestoredRef.current = true;
+            });
+            return;
+          }
+        } catch {
+          // Gateway unavailable — start from top
+        }
+      }
+
+      // No saved position — start from top
+      positionRestoredRef.current = true;
+    };
+
+    restore();
+  }, [filePath, content, gatewayService]);
+
+  // Cleanup on unmount or file change
+  useEffect(() => {
+    return () => {
+      clearAutoScrollTimer();
+      stopIndicatorInterval();
+      autoScrollEnabledRef.current = false;
+    };
+  }, [filePath, clearAutoScrollTimer, stopIndicatorInterval]);
+
   return (
     <div className="file-viewer-container">
-      <div className="file-viewer-content">
+      <div
+        ref={viewerRef}
+        className="file-viewer-content"
+        onClick={toggleAutoScroll}
+      >
         <pre className="file-content-body">{content || '(Empty file)'}</pre>
       </div>
+      {indicatorText && (
+        <div className="auto-scroll-indicator">{indicatorText}</div>
+      )}
     </div>
   );
 };
