@@ -6,7 +6,7 @@ import { resolveConfig } from './services/ConnectionConfig';
 import { FileSystemItem, ScreenType, AgentContext } from './domain/types';
 import { Navbar } from './components/Navbar';
 import { FileTable } from './components/FileTable';
-import { FileViewer } from './components/FileViewer';
+import { FileViewer, type FileViewerHandle } from './components/FileViewer';
 import { HistoryPage } from './components/HistoryPage';
 import { AgentScreen } from './components/AgentScreen';
 import { SettingsModal } from './components/SettingsModal';
@@ -15,6 +15,7 @@ import { CreateFolderDialog } from './components/CreateFolderDialog';
 import { DeleteConfirmDialog } from './components/DeleteConfirmDialog';
 import { UploadDialog } from './components/UploadDialog';
 import { ContextActionMenu, ContextActionMenuItem } from './components/ContextActionMenu';
+import { MoveCopyBar, MoveCopyMode } from './components/MoveCopyBar';
 import { Toast } from './components/Toast';
 import { G2RuntimeManager, G2RuntimeState } from './hud/g2-runtime';
 import { addToHistory } from './services/ViewerHistoryStore';
@@ -37,6 +38,27 @@ function isGatewayService(s: FileSystemService): s is GatewayFileSystemService {
   return s instanceof GatewayFileSystemService;
 }
 
+function pickUniqueTextFileName(existingNames: Set<string>): string {
+  const baseName = '新規テキストドキュメント.txt';
+  if (!existingNames.has(baseName)) return baseName;
+  for (let i = 2; ; i++) {
+    const candidate = `新規テキストドキュメント (${i}).txt`;
+    if (!existingNames.has(candidate)) return candidate;
+  }
+}
+
+// Path key for case/separator-insensitive comparison (Windows-style paths).
+function normalizePathKey(p: string): string {
+  return p.replace(/[\/\\]+$/, '').replace(/\\/g, '/').toLowerCase();
+}
+
+/** true when targetPath equals folderPath or lies anywhere inside it. */
+function isPathWithinFolder(folderPath: string, targetPath: string): boolean {
+  const folder = normalizePathKey(folderPath);
+  const target = normalizePathKey(targetPath);
+  return target === folder || target.startsWith(folder + '/');
+}
+
 export function App() {
   const [fileService, setFileService] = useState<FileSystemService>(() => createFileService());
 
@@ -54,6 +76,11 @@ export function App() {
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
   const [selectedFile, setSelectedFile] = useState<FileSystemItem | null>(null);
   const [fileContent, setFileContent] = useState<string>('');
+
+  // File Viewer edit mode
+  const [fileEditing, setFileEditing] = useState<boolean>(false);
+  const [fileEditDirty, setFileEditDirty] = useState<boolean>(false);
+  const fileViewerRef = useRef<FileViewerHandle>(null);
 
   // Return highlight (temporary highlight when navigating back)
   const [highlightPath, setHighlightPath] = useState<string | null>(null);
@@ -79,6 +106,14 @@ export function App() {
 
   // Upload dialog state
   const [showUploadDialog, setShowUploadDialog] = useState<boolean>(false);
+
+  // Move/Copy picker state (sources are snapshotted when the mode starts)
+  const [moveCopySession, setMoveCopySession] = useState<{
+    mode: MoveCopyMode;
+    sources: FileSystemItem[];
+    originPath: string;
+  } | null>(null);
+  const [isMoveCopying, setIsMoveCopying] = useState<boolean>(false);
 
   // Explorer Ready state
   const [isExplorerReady, setIsExplorerReady] = useState<boolean>(false);
@@ -164,6 +199,28 @@ export function App() {
     // Explorer: can go back if not at root
     const parentPath = fileService.getParentPath(explorerPath);
     return parentPath !== explorerPath;
+  };
+
+  // Leaving the File Viewer discards edit mode / dirty flag.
+  useEffect(() => {
+    if (currentScreen !== 'file_viewer') {
+      setFileEditing(false);
+      setFileEditDirty(false);
+    }
+  }, [currentScreen]);
+
+  useEffect(() => {
+    if (!fileEditing) {
+      setFileEditDirty(false);
+    }
+  }, [fileEditing]);
+
+  // Guard: block navigation that would silently discard unsaved edits.
+  const confirmDiscardFileEdits = (message: string): boolean => {
+    if (currentScreen === 'file_viewer' && fileEditing && fileEditDirty) {
+      return window.confirm(message);
+    }
+    return true;
   };
 
   // ── PWA Initialization ────────────────────────────────────
@@ -275,6 +332,9 @@ export function App() {
 
   // Back button: return to previous screen based on current absolute path
   const handleExplorerBack = async () => {
+    if (!confirmDiscardFileEdits('編集した内容が失われます。本当に戻りますか？')) {
+      return;
+    }
     if (currentScreen === 'file_viewer') {
       if (returnPage === 'history') {
         // FileViewer opened from History → go back to History
@@ -299,6 +359,9 @@ export function App() {
   };
 
   const handleExplorerReload = async () => {
+    if (!confirmDiscardFileEdits('編集した内容が失われます。本当に再読み込みしますか？')) {
+      return;
+    }
     setHighlightPath(null);
     await navigateToPath(explorerPath);
   };
@@ -341,73 +404,176 @@ export function App() {
   const selectedItems = items.filter((i) => selectedPaths.has(i.path));
   const hasSelectedFolders = selectedItems.some((i) => i.type === 'directory');
 
-  const actionMenuItems: ContextActionMenuItem[] = [
-    {
-      label: '並び順切替',
-      disabled: !isExplorerReady,
-      onClick: () => {
-        handleToggleSortMode();
-      },
-    },
-    {
-      label: 'フォルダを作成',
-      disabled: !isExplorerReady,
-      onClick: () => {
-        setCreateFolderError('');
-        setIsCreatingFolder(false);
-        setShowCreateFolderDialog(true);
-      },
-    },
-    {
-      label: 'アップロード',
-      disabled: !isExplorerReady,
-      onClick: () => {
-        setShowUploadDialog(true);
-      },
-    },
-    {
-      label: 'ダウンロード',
-      disabled: !isExplorerReady || selectedCount === 0,
-      onClick: () => {
-        handleDownload();
-      },
-    },
-    {
-      label: '名前を変更',
-      disabled: !isExplorerReady || selectedCount !== 1,
-      onClick: () => {
-        const target = selectedItems[0];
-        if (target) {
-          setRenameTarget(target);
-          setRenameError('');
-          setShowRenameDialog(true);
-        }
-      },
-    },
-    {
-      label: '削除',
-      disabled: !isExplorerReady || selectedCount === 0,
-      onClick: () => {
-        setShowDeleteDialog(true);
-      },
-    },
-  ];
+  const actionMenuItems: ContextActionMenuItem[] = currentScreen === 'file_viewer' && selectedFile
+    ? (fileEditing
+        ? [
+            {
+              label: 'ダウンロード',
+              onClick: () => {
+                handleDownloadForPaths([selectedFile.path], selectedFile.name);
+              },
+            },
+            {
+              // Rename during editing would desync the edit buffer and the file.
+              label: '名前を変更',
+              disabled: true,
+              onClick: () => {
+                setRenameTarget(selectedFile);
+                setRenameError('');
+                setShowRenameDialog(true);
+              },
+            },
+            {
+              label: '上書き保存',
+              onClick: () => {
+                handleFileEditSave();
+              },
+            },
+            {
+              label: '保存せずに再表示',
+              onClick: () => {
+                handleFileEditReload();
+              },
+            },
+            {
+              // Delete during editing would discard unsaved edits.
+              label: '削除',
+              disabled: true,
+              onClick: () => {
+                setShowDeleteDialog(true);
+              },
+            },
+          ]
+        : [
+            {
+              label: 'ダウンロード',
+              onClick: () => {
+                handleDownloadForPaths([selectedFile.path], selectedFile.name);
+              },
+            },
+            {
+              label: '名前を変更',
+              onClick: () => {
+                setRenameTarget(selectedFile);
+                setRenameError('');
+                setShowRenameDialog(true);
+              },
+            },
+            {
+              label: '編集',
+              onClick: () => {
+                setFileEditing(true);
+              },
+            },
+            {
+              label: '削除',
+              onClick: () => {
+                setShowDeleteDialog(true);
+              },
+            },
+          ])
+    : [
+        {
+          label: '並び順切替',
+          disabled: !isExplorerReady,
+          onClick: () => {
+            handleToggleSortMode();
+          },
+        },
+        {
+          label: 'ファイルを作成',
+          disabled: !isExplorerReady,
+          onClick: () => {
+            handleCreateTextFile();
+          },
+        },
+        {
+          label: 'フォルダを作成',
+          disabled: !isExplorerReady,
+          onClick: () => {
+            setCreateFolderError('');
+            setIsCreatingFolder(false);
+            setShowCreateFolderDialog(true);
+          },
+        },
+        {
+          label: 'アップロード',
+          disabled: !isExplorerReady,
+          onClick: () => {
+            setShowUploadDialog(true);
+          },
+        },
+        {
+          label: 'ダウンロード',
+          disabled: !isExplorerReady || selectedCount === 0,
+          onClick: () => {
+            handleDownload();
+          },
+        },
+        {
+          label: '名前を変更',
+          disabled: !isExplorerReady || selectedCount !== 1,
+          onClick: () => {
+            const target = selectedItems[0];
+            if (target) {
+              setRenameTarget(target);
+              setRenameError('');
+              setShowRenameDialog(true);
+            }
+          },
+        },
+        {
+          label: '移動',
+          disabled: !isExplorerReady || selectedCount === 0 || !!moveCopySession,
+          onClick: () => {
+            handleStartMoveCopy('move');
+          },
+        },
+        {
+          label: '複製',
+          disabled: !isExplorerReady || selectedCount === 0 || !!moveCopySession,
+          onClick: () => {
+            handleStartMoveCopy('copy');
+          },
+        },
+        {
+          label: '削除',
+          disabled: !isExplorerReady || selectedCount === 0,
+          onClick: () => {
+            setShowDeleteDialog(true);
+          },
+        },
+      ];
 
   // ── Rename ───────────────────────────────────────────────
 
   const handleRenameConfirm = useCallback(async (newName: string) => {
     if (!renameTarget) return;
     try {
-      await fileService.renameItem(renameTarget.path, newName);
+      const newPath = await fileService.renameItem(renameTarget.path, newName);
       setShowRenameDialog(false);
       setRenameTarget(null);
+      setRenameError('');
+
+      if (currentScreen === 'file_viewer') {
+        const fileName = newPath.split(/[\/\\]/).pop() || newName;
+        setSelectedFile((prev) => prev ? { ...prev, name: fileName, path: newPath, id: newPath } : prev);
+        try {
+          const content = await fileService.readFile(newPath);
+          setFileContent(content);
+        } catch {
+          // keep previous content on read failure
+        }
+        return;
+      }
+
       setSelectedPaths(new Set());
       setHighlightPath(null);
       await navigateToPath(explorerPath);
     } catch (e: any) {
       setRenameError(e.message || '名前の変更に失敗しました。');
     }
-  }, [renameTarget, fileService, explorerPath]);
+  }, [renameTarget, fileService, explorerPath, currentScreen]);
 
   const handleRenameCancel = useCallback(() => {
     setShowRenameDialog(false);
@@ -444,6 +610,29 @@ export function App() {
   // ── Delete ───────────────────────────────────────────────
 
   const handleDeleteConfirm = useCallback(async () => {
+    if (currentScreen === 'file_viewer' && selectedFile) {
+      setIsDeleting(true);
+      try {
+        await fileService.deleteItems([selectedFile.path]);
+        setShowDeleteDialog(false);
+        setSelectedFile(null);
+        setFileContent('');
+        setSelectedPaths(new Set());
+        setHighlightPath(null);
+        if (returnPage === 'history') {
+          setCurrentScreen('history');
+        } else {
+          const parentPath = fileService.getParentPath(selectedFile.path);
+          await navigateToPath(parentPath);
+        }
+      } catch (e: any) {
+        alert(`削除に失敗しました: ${e.message}`);
+      } finally {
+        setIsDeleting(false);
+      }
+      return;
+    }
+
     const paths = Array.from(selectedPaths);
     if (paths.length === 0) return;
     setIsDeleting(true);
@@ -458,13 +647,54 @@ export function App() {
     } finally {
       setIsDeleting(false);
     }
-  }, [selectedPaths, fileService, explorerPath]);
+  }, [selectedPaths, selectedFile, fileService, explorerPath, currentScreen, returnPage]);
 
   const handleDeleteCancel = useCallback(() => {
     if (!isDeleting) {
       setShowDeleteDialog(false);
     }
   }, [isDeleting]);
+
+  // ── Create Text File ─────────────────────────────────────
+
+  const handleCreateTextFile = useCallback(async () => {
+    try {
+      const beforePaths = new Set(items.map((i) => i.path));
+      const fileName = pickUniqueTextFileName(new Set(items.map((i) => i.name)));
+      const file = new File([''], fileName, { type: 'text/plain;charset=utf-8' });
+      const result = await fileService.uploadItems(explorerPath, [
+        { file, relativePath: fileName },
+      ]);
+      if (result.errors && result.errors.length > 0) {
+        throw new Error(result.errors[0].error || 'ファイル作成エラー');
+      }
+      if (result.uploaded < 1) {
+        throw new Error('ファイルが作成されませんでした');
+      }
+
+      let createdName = fileName;
+      try {
+        const loadedItems = await fileService.getDirectory(explorerPath, sortMode);
+        setItems(loadedItems);
+        const created =
+          loadedItems.find(
+            (i) =>
+              !beforePaths.has(i.path) &&
+              /^新規テキストドキュメント\s*(\(\d+\))?\.txt$/.test(i.name),
+          ) || loadedItems.find((i) => !beforePaths.has(i.path));
+        if (created) {
+          createdName = created.name;
+          setHighlightPath(created.path);
+        }
+      } catch (e) {
+        console.error('[App] Failed to refresh directory after file creation:', e);
+      }
+
+      setToast({ message: 'ファイルを作成しました', detail: createdName });
+    } catch (e: any) {
+      alert(`ファイルの作成に失敗しました: ${e.message}`);
+    }
+  }, [fileService, explorerPath, items, sortMode]);
 
   // ── Upload ───────────────────────────────────────────────
 
@@ -476,17 +706,14 @@ export function App() {
 
   // ── Download ──────────────────────────────────────────────
 
-  const handleDownload = useCallback(async () => {
-    const paths = Array.from(selectedPaths);
+  const handleDownloadForPaths = useCallback(async (paths: string[], filenameHint: string, hasDirectory: boolean = false) => {
     if (paths.length === 0) return;
-
-    const hasDirectory = selectedItems.some((i) => i.type === 'directory');
 
     let downloadFilename: string;
     if (paths.length === 1 && !hasDirectory) {
-      downloadFilename = selectedItems[0]?.name || 'file';
+      downloadFilename = filenameHint || 'file';
     } else if (paths.length === 1 && hasDirectory) {
-      downloadFilename = (selectedItems[0]?.name || 'folder') + '.zip';
+      downloadFilename = (filenameHint || 'folder') + '.zip';
     } else {
       downloadFilename = 'download.zip';
     }
@@ -514,16 +741,176 @@ export function App() {
     } catch (e: any) {
       alert(`ダウンロードに失敗しました: ${e.message}`);
     }
-  }, [selectedPaths, selectedItems, fileService]);
+  }, [fileService]);
+
+  const handleDownload = useCallback(async () => {
+    const paths = Array.from(selectedPaths);
+    if (paths.length === 0) return;
+
+    const hasDirectory = selectedItems.some((i) => i.type === 'directory');
+    const singleName = paths.length === 1 ? (selectedItems[0]?.name || 'file') : '';
+    await handleDownloadForPaths(paths, singleName, hasDirectory);
+  }, [selectedPaths, selectedItems, handleDownloadForPaths]);
+
+  // ── Move / Copy ─────────────────────────────────────────────
+
+  // Active source folders: themselves and their subtrees are invalid destinations.
+  const pickerBlockedFolderPaths = moveCopySession
+    ? moveCopySession.sources.filter((s) => s.type === 'directory').map((s) => s.path)
+    : [];
+
+  const isPickerPathBlocked = (path: string): boolean =>
+    pickerBlockedFolderPaths.some((folder) => isPathWithinFolder(folder, path));
+
+  const handleStartMoveCopy = (mode: MoveCopyMode) => {
+    if (selectedItems.length === 0) return;
+    setMoveCopySession({
+      mode,
+      sources: selectedItems,
+      originPath: explorerPath,
+    });
+    setSelectedPaths(new Set());
+    setHighlightPath(null);
+  };
+
+  const handleMoveCopyCancel = useCallback(async () => {
+    if (!moveCopySession) return;
+    const { originPath, sources } = moveCopySession;
+    setMoveCopySession(null);
+    await navigateToPath(originPath);
+    setSelectedPaths(new Set(sources.map((s) => s.path)));
+  }, [moveCopySession]);
+
+  const handleMoveCopyConfirm = useCallback(async () => {
+    if (!moveCopySession || isMoveCopying) return;
+    const { mode, sources } = moveCopySession;
+    const destDir = explorerPath;
+    const paths = sources.map((s) => s.path);
+
+    // Client-side safety: folder must not go into itself / its subtree.
+    if (
+      sources.some((s) => s.type === 'directory' && isPathWithinFolder(s.path, destDir))
+    ) {
+      alert('フォルダ自身またはその配下へは移動・複製できません。');
+      return;
+    }
+
+    // Client-side: same-directory move is a no-op.
+    if (mode === 'move') {
+      const firstParent = fileService.getParentPath(sources[0].path);
+      const norm = (p: string) => p.replace(/[\/\\]+$/, '').replace(/\\/g, '/').toLowerCase();
+      if (norm(firstParent) === norm(destDir)) {
+        setMoveCopySession(null);
+        await navigateToPath(destDir);
+        setSelectedPaths(new Set(paths));
+        setToast({ message: '移動先が同じ場所です' });
+        return;
+      }
+    }
+
+    setIsMoveCopying(true);
+    try {
+      const result = mode === 'move'
+        ? await fileService.moveItems(paths, destDir)
+        : await fileService.copyItems(paths, destDir);
+
+      setMoveCopySession(null);
+      setSelectedPaths(new Set());
+      setHighlightPath(null);
+      await navigateToPath(destDir);
+
+      // Highlight the first affected item at the destination.
+      const firstDest = result.results.find((r) => r.dest)?.dest;
+      if (firstDest) setHighlightPath(firstDest);
+
+      const failedItems = result.results.filter((r) => r.status === 'failed');
+      if (failedItems.length > 0) {
+        const lines = failedItems
+          .slice(0, 5)
+          .map((r) => {
+            const name = r.source.split(/[\/\\]/).pop() || r.source;
+            return `${name}: ${r.error || '失敗しました'}`;
+          })
+          .join('\n');
+        const more = failedItems.length > 5 ? `\n他${failedItems.length - 5}件` : '';
+        alert(
+          `${mode === 'move' ? '移動' : '複製'}: 成功 ${result.processed}件 / 失敗 ${failedItems.length}件\n${lines}${more}`,
+        );
+      } else {
+        setToast({
+          message: mode === 'move' ? '移動しました' : '複製しました',
+          detail: `${result.processed}件 → ${destDir}`,
+        });
+      }
+    } catch (e: any) {
+      alert(`${mode === 'move' ? '移動' : '複製'}に失敗しました: ${e.message}`);
+    } finally {
+      setIsMoveCopying(false);
+    }
+  }, [moveCopySession, isMoveCopying, explorerPath, fileService]);
+
+  // ── File Viewer Edit ───────────────────────────────────────
+
+  const handleFileEditSave = useCallback(async () => {
+    if (!selectedFile) return;
+    const edited = fileViewerRef.current?.getEditedText();
+    if (edited === null || edited === undefined) return;
+
+    try {
+      const parentPath = fileService.getParentPath(selectedFile.path);
+      const fileName = selectedFile.path.split(/[\/\\]/).pop() || selectedFile.name;
+      const file = new File([edited], fileName, { type: 'text/plain;charset=utf-8' });
+      // Reuse the existing upload pipeline with overwrite enabled.
+      const result = await fileService.uploadItems(
+        parentPath,
+        [{ file, relativePath: fileName }],
+        undefined,
+        undefined,
+        { overwrite: true },
+      );
+      if (result.errors && result.errors.length > 0) {
+        throw new Error(result.errors[0].error || '書き込みエラー');
+      }
+      if (result.uploaded < 1) {
+        throw new Error('ファイルが書き込まれませんでした');
+      }
+      // Reflect the saved content immediately, then leave edit mode.
+      setFileContent(edited);
+      setFileEditing(false);
+      setToast({ message: '保存完了', detail: fileName });
+    } catch (e: any) {
+      alert(`保存に失敗しました: ${e.message}`);
+    }
+  }, [selectedFile, fileService]);
+
+  const handleFileEditReload = useCallback(async () => {
+    if (!selectedFile) return;
+    if (fileEditDirty && !window.confirm('編集内容が失われます。保存せずに再表示しますか？')) {
+      return;
+    }
+    try {
+      const fresh = await fileService.readFile(selectedFile.path);
+      setFileContent(fresh);
+      setFileEditing(false);
+    } catch (e: any) {
+      alert(`再表示に失敗しました: ${e.message}`);
+    }
+  }, [selectedFile, fileService, fileEditDirty]);
 
   // Folder click from FileTable
   const handleOpenDirectory = async (path: string, _index: number) => {
+    // Move/Copy picker: never navigate into a source folder or its subtree
+    // (those can never be a valid destination).
+    if (isPickerPathBlocked(path)) return;
     await navigateToPath(path);
   };
 
   // Agent/Explorer switching
   const handleOpenAgent = () => {
     if (!isDesktop) {
+      if (!confirmDiscardFileEdits('編集した内容が失われます。本当にエージェントを表示しますか？')) {
+        return;
+      }
       previousScreenRef.current = currentScreen;
       setCurrentScreen('agent');
     }
@@ -667,6 +1054,17 @@ export function App() {
     return explorerPath;
   };
 
+  // Navigate to History, remembering the current screen/page as the return point.
+  // Shared by Explorer path bar and Agent path bar taps.
+  const handleNavigateToHistory = () => {
+    if (!confirmDiscardFileEdits('編集した内容が失われます。本当に履歴を表示しますか？')) {
+      return;
+    }
+    historyReturnScreenRef.current = currentScreen;
+    historyReturnPageRef.current = returnPage;
+    setCurrentScreen('history');
+  };
+
   // Determine which pane is first/last for swap button placement
   const isFirstExplorer = paneOrder[0] === 'explorer';
 
@@ -686,16 +1084,14 @@ export function App() {
         showSettingsButton={isDesktop && !isFirstExplorer}
         showSwapButton={isDesktop && !isFirstExplorer}
         onSwapPanes={handleSwapPanes}
-        onPathBarClick={() => {
-          historyReturnScreenRef.current = currentScreen;
-          historyReturnPageRef.current = returnPage;
-          setCurrentScreen('history');
-        }}
-        onOpenActionMenu={currentScreen === 'explorer'
-          ? handleOpenActionMenu
-          : currentScreen === 'history'
-            ? historyActionMenuHandler || undefined
-            : undefined}
+        onPathBarClick={currentScreen === 'history' ? undefined : handleNavigateToHistory}
+        onOpenActionMenu={
+          currentScreen === 'explorer' || currentScreen === 'file_viewer'
+            ? handleOpenActionMenu
+            : currentScreen === 'history'
+              ? historyActionMenuHandler || undefined
+              : undefined
+        }
       />
 
       <div className="main-content-container">
@@ -705,6 +1101,8 @@ export function App() {
               items={items}
               selectedPaths={selectedPaths}
               highlightPath={highlightPath}
+              pickerMode={!!moveCopySession}
+              isPickerPathBlocked={isPickerPathBlocked}
               onSelectItem={() => {
                 // No-op: selection is now via toggle; item click opens/navigates
               }}
@@ -716,9 +1114,12 @@ export function App() {
 
           {currentScreen === 'file_viewer' && selectedFile && (
             <FileViewer
+              ref={fileViewerRef}
               content={fileContent}
               filePath={selectedFile.path}
               gatewayService={isGatewayService(fileService) ? fileService as GatewayFileSystemService : null}
+              editing={fileEditing}
+              onDirtyChange={setFileEditDirty}
             />
           )}
 
@@ -741,6 +1142,19 @@ export function App() {
           )}
         </main>
       </div>
+
+      {currentScreen === 'explorer' && moveCopySession && (
+        <MoveCopyBar
+          mode={moveCopySession.mode}
+          count={moveCopySession.sources.length}
+          sourceNames={moveCopySession.sources.map((s) => s.name)}
+          destPath={explorerPath}
+          destBlocked={isPickerPathBlocked(explorerPath)}
+          isBusy={isMoveCopying}
+          onCancel={handleMoveCopyCancel}
+          onConfirm={handleMoveCopyConfirm}
+        />
+      )}
     </div>
   );
 
@@ -754,6 +1168,7 @@ export function App() {
         buildLiveContext={buildLiveContext}
         onOpenSettings={() => setShowSettings(true)}
         onOpenExplorer={handleOpenExplorer}
+        onPathBarClick={currentScreen === 'history' ? undefined : handleNavigateToHistory}
         showSettingsButton={isDesktop && isFirstExplorer}
         showSwapButton={isDesktop && isFirstExplorer}
         onSwapPanes={handleSwapPanes}
@@ -824,8 +1239,8 @@ export function App() {
       {/* Delete Confirm Dialog */}
       <DeleteConfirmDialog
         isOpen={showDeleteDialog}
-        count={selectedCount}
-        hasFolders={hasSelectedFolders}
+        count={currentScreen === 'file_viewer' && selectedFile ? 1 : selectedCount}
+        hasFolders={currentScreen === 'file_viewer' ? false : hasSelectedFolders}
         onConfirm={handleDeleteConfirm}
         onCancel={handleDeleteCancel}
         isDeleting={isDeleting}

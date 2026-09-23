@@ -1,5 +1,5 @@
 import { FileSystemItem, SharedViewerState } from '../domain/types';
-import { FileSystemService, UploadItem, UploadResult } from './FileSystemService';
+import { FileSystemService, MoveCopyResult, UploadItem, UploadResult } from './FileSystemService';
 
 export class GatewayFileSystemService implements FileSystemService {
   private baseUrl: string;
@@ -190,6 +190,28 @@ export class GatewayFileSystemService implements FileSystemService {
     return data.path;
   }
 
+  async moveItems(paths: string[], destDir: string): Promise<MoveCopyResult> {
+    return this.moveCopyItems('/api/fs/move', paths, destDir);
+  }
+
+  async copyItems(paths: string[], destDir: string): Promise<MoveCopyResult> {
+    return this.moveCopyItems('/api/fs/copy', paths, destDir);
+  }
+
+  private async moveCopyItems(endpoint: string, paths: string[], destDir: string): Promise<MoveCopyResult> {
+    const res = await this.requestWithBody('POST', endpoint, { paths, destDir });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error?.message || `Failed to move/copy: ${res.status}`);
+    }
+    return {
+      processed: data.processed || 0,
+      skipped: data.skipped || 0,
+      failed: data.failed || 0,
+      results: data.results || [],
+    };
+  }
+
   getDownloadUrl(path: string): string | null {
     if (!this._isAvailable) return null;
     const encoded = encodeURIComponent(path);
@@ -214,6 +236,7 @@ export class GatewayFileSystemService implements FileSystemService {
     files: UploadItem[],
     onProgress?: (loaded: number, total: number) => void,
     signal?: AbortSignal,
+    options?: { overwrite?: boolean },
   ): Promise<UploadResult> {
     const formData = new FormData();
     formData.append('destPath', parentPath);
@@ -225,6 +248,10 @@ export class GatewayFileSystemService implements FileSystemService {
     for (const item of files) {
       formData.append('files', item.file, item.file.name);
       formData.append('relativePaths', item.relativePath);
+    }
+
+    if (options?.overwrite) {
+      formData.append('overwrite', '1');
     }
 
     return new Promise<UploadResult>((resolve, reject) => {

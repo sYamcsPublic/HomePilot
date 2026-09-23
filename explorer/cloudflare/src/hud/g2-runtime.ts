@@ -14,6 +14,10 @@ import { OpenCodeClient } from '../services/OpenCodeClient';
 import { G2AgentController } from './g2-agent/g2-agent-controller';
 import { AgentStateStore } from './g2-agent/agent-state-store';
 import { resolveConfig } from '../services/ConnectionConfig';
+import {
+  loadG2StartupScreen,
+  resolveG2StartupPage,
+} from '../services/G2StartupScreenSettings';
 
 export type G2RuntimeState = 'inactive' | 'starting' | 'active' | 'stopping';
 
@@ -186,7 +190,8 @@ export class G2RuntimeManager {
    * 3. GatewayFileSystemService initialize()
    * 4. OpenCodeClient creation
    * 5. G2AgentController creation + initialize()
-   * 6. Navigate to G2 Explorer
+   * 6. Navigate to the configured startup screen
+   *    (エクスプローラー / エージェント / 履歴 — PWA setting, default エクスプローラー)
    */
   async startG2Runtime(): Promise<void> {
     // Prevent double-start
@@ -237,23 +242,43 @@ export class G2RuntimeManager {
         this.g2AgentController.setBridge(this.bridge);
       }
 
-      // 6. Create ExplorerPage and navigate to it on G2
+      // 6. Create the initial page according to the startup screen setting
       // Gateway is always initialized before this point (step 3)
-      this.updateStatus('Loading G2 Explorer...');
-      const rootPath = this.gatewayService
-        ? this.gatewayService.getRootPath()
-        : '/home';
-      const explorerPage = new ExplorerPage(
-        rootPath,
-        this.gatewayService!,
-        undefined,
-        undefined,
-        undefined,
-        () => this.navigateToAgentFromExplorer(),
-        this.gatewayService,
-        () => this.navigateToHistory(),
-      );
-      await this.pageManager.navigateTo(explorerPage);
+      const startupPage = resolveG2StartupPage(loadG2StartupScreen(), {
+        hasGateway: this.gatewayService !== null,
+        hasAgent: this.g2AgentController !== null,
+      });
+
+      if (startupPage === 'history') {
+        // Startup History has no "page entered from" origin, so clear the
+        // History return point: double-tap then always falls back to the
+        // root Explorer (G2起動 → History → Double Tap → Root Explorer).
+        // Normal History return paths (navigateToHistory from other pages)
+        // are unaffected.
+        this.updateStatus('Loading G2 History...');
+        this.historyReturnPage = null;
+        await this.navigateToHistory();
+      } else if (startupPage === 'agent') {
+        this.updateStatus('Loading G2 Agent...');
+        this.agentReturnPage = null;
+        await this.navigateToSessionList();
+      } else {
+        this.updateStatus('Loading G2 Explorer...');
+        const rootPath = this.gatewayService
+          ? this.gatewayService.getRootPath()
+          : '/home';
+        const explorerPage = new ExplorerPage(
+          rootPath,
+          this.gatewayService!,
+          undefined,
+          undefined,
+          undefined,
+          () => this.navigateToAgentFromExplorer(),
+          this.gatewayService,
+          () => this.navigateToHistory(),
+        );
+        await this.pageManager.navigateTo(explorerPage);
+      }
 
       this.setState('active');
       this.updateStatus('G2 Runtime active');
@@ -417,6 +442,7 @@ export class G2RuntimeManager {
       this.g2AgentController,
       () => this.returnToSessionList(),
       () => this.navigateFromAgentToExplorer(),
+      () => this.navigateToHistory(),
       this.agentCurrentPath,
       this.agentReturnPage,
     );
@@ -453,6 +479,7 @@ export class G2RuntimeManager {
       (sessionID) => this.navigateToAgentChat(sessionID),
       () => this.navigateToModelSelect(),
       () => this.navigateFromAgentToExplorer(),
+      () => this.navigateToHistory(),
       this.agentCurrentPath,
     );
   }
@@ -484,16 +511,23 @@ export class G2RuntimeManager {
   /**
    * Navigate from Agent (Session List or Chat) back to the original
    * Explorer/FileViewer page. Clears agentReturnPage and sessionListPage.
+   * Falls back to a fresh root Explorer if the return point was already
+   * consumed (e.g. Agent was re-entered via History).
    */
   async navigateFromAgentToExplorer(): Promise<void> {
-    if (!this.pageManager || !this.agentReturnPage) return;
+    if (!this.pageManager) return;
 
     const returnPage = this.agentReturnPage;
     this.agentReturnPage = null;
     this.sessionListPage = null;
     this.modelSelectPage = null;
 
-    await this.pageManager.navigateTo(returnPage);
+    if (returnPage) {
+      await this.pageManager.navigateTo(returnPage);
+      return;
+    }
+
+    await this.navigateToRootExplorer();
   }
 
   /**
@@ -523,17 +557,25 @@ export class G2RuntimeManager {
   // ── History Navigation ────────────────────────────────────
 
   /**
-   * Navigate from Explorer/FileViewer to History page.
-   * Saves the current Explorer/FileViewer page for return navigation.
+   * Navigate from Explorer/FileViewer/Agent pages to History page.
+   * Saves the current page as the History return point, so Back from
+   * History restores whichever screen was used to enter (Explorer,
+   * File Viewer, Agent Session List, or Agent Chat).
    */
   async navigateToHistory(): Promise<void> {
     if (!this.pageManager || !this.gatewayService) return;
 
     const currentPage = this.pageManager.getCurrentPage();
-    const isFromExplorer = currentPage?.pageType === 'ExplorerPage' || currentPage?.pageType === 'FileViewerPage';
+    const pageType = currentPage?.pageType;
+    const canReturnToCurrent =
+      pageType === 'ExplorerPage' ||
+      pageType === 'FileViewerPage' ||
+      pageType === 'AgentSessionListPage' ||
+      pageType === 'AgentChatPage';
 
-    // Save the return page only when entering from Explorer/FileViewer
-    if (isFromExplorer && !this.historyReturnPage) {
+    // Save the current page as the return point (always overwrite so a
+    // stale value left by an earlier History excursion cannot win)
+    if (canReturnToCurrent) {
       this.historyReturnPage = currentPage || null;
     }
 
@@ -544,16 +586,20 @@ export class G2RuntimeManager {
       fileService,
       undefined,
       undefined,
-      () => this.navigateToAgentFromExplorer(),
-      () => this.navigateFromHistoryToExplorer(),
+      () => this.navigateToAgentFromExplorer(),   // onAgentSessionList (forwarded to FileViewer)
+      () => this.navigateFromHistoryToExplorer(), // onBackToExplorer (double-tap: back to origin page)
+      // Context menu — explicit screen transitions (never restore the origin page):
+      () => this.navigateToRootExplorer(),        // "エクスプローラ画面へ" → root Explorer
+      () => this.navigateToSessionList(),         // "エージェント画面へ" → Agent Session List
     );
 
     await this.pageManager.navigateTo(this.historyPage);
   }
 
   /**
-   * Navigate from History back to the original Explorer/FileViewer page.
-   * Restores the saved page instance (preserving path, selection, etc.).
+   * Navigate from History back to the original entry page
+   * (Explorer/FileViewer/Agent Session List/Agent Chat).
+   * Restores the saved page instance (preserving path, selection, scroll, etc.).
    */
   async navigateFromHistoryToExplorer(): Promise<void> {
     if (!this.pageManager) return;
@@ -563,23 +609,37 @@ export class G2RuntimeManager {
     this.historyPage = null;
 
     if (returnPage) {
+      // Re-adopt the restored Session List instance so runtime fields stay
+      // consistent even if navigateFromAgentToExplorer() had cleared it.
+      if (returnPage.pageType === 'AgentSessionListPage') {
+        this.sessionListPage = returnPage as AgentSessionListPage;
+      }
       await this.pageManager.navigateTo(returnPage);
     } else {
       // Fallback: create new Explorer at root (should not happen in normal flow)
-      if (!this.gatewayService) return;
-      const rootPath = this.gatewayService.getRootPath();
-      const explorerPage = new ExplorerPage(
-        rootPath,
-        this.gatewayService,
-        undefined,
-        undefined,
-        undefined,
-        () => this.navigateToAgentFromExplorer(),
-        this.gatewayService,
-        () => this.navigateToHistory(),
-      );
-      await this.pageManager.navigateTo(explorerPage);
+      await this.navigateToRootExplorer();
     }
+  }
+
+  /**
+   * Create and navigate to a fresh Explorer at the gateway root.
+   * Used as a fallback when a saved return page is missing.
+   */
+  private async navigateToRootExplorer(): Promise<void> {
+    if (!this.pageManager || !this.gatewayService) return;
+
+    const rootPath = this.gatewayService.getRootPath();
+    const explorerPage = new ExplorerPage(
+      rootPath,
+      this.gatewayService,
+      undefined,
+      undefined,
+      undefined,
+      () => this.navigateToAgentFromExplorer(),
+      this.gatewayService,
+      () => this.navigateToHistory(),
+    );
+    await this.pageManager.navigateTo(explorerPage);
   }
 
   // ── Cleanup ───────────────────────────────────────────────
