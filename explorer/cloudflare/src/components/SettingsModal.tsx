@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import {
   X,
   Wifi,
@@ -37,6 +37,8 @@ import {
   applyColorTheme,
   ColorTheme,
 } from '../services/ColorThemeSettings';
+import { StorageSection } from './StorageSection';
+import { getLocalFileSystemUsage, getSiteStorageUsage } from '../services/StorageUsage';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -67,6 +69,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [g2StartupScreen, setG2StartupScreen] = useState<G2StartupScreen>(() => loadG2StartupScreen());
   const [colorTheme, setColorTheme] = useState<ColorTheme>(() => loadColorTheme());
   const pasteInputRef = useRef<HTMLTextAreaElement>(null);
+
+  // ストレージ表示: A/B は同期で localStorage を読む、C のみ非同期。
+  const localUsage = useMemo(() => getLocalFileSystemUsage(), [isOpen]);
+  const [siteUsageBytes, setSiteUsageBytes] = useState<number | null | undefined>(undefined);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setSiteUsageBytes(undefined);
+      return undefined;
+    }
+    let cancelled = false;
+    setSiteUsageBytes(undefined);
+    getSiteStorageUsage().then((bytes) => {
+      if (!cancelled) setSiteUsageBytes(bytes);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen]);
 
   useEffect(() => {
     if (isOpen) {
@@ -326,6 +347,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           )}
 
+          {/* Storage usage (Local FileSystem / browser estimate) */}
+          <StorageSection info={{ ...localUsage, siteUsageBytes }} />
+
           {/* G2 Startup Screen */}
           <section className="settings-section">
             <h3>グラス起動時の画面</h3>
@@ -334,6 +358,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <label className="settings-label">起動時に表示する画面</label>
               <div className="settings-radio-group">
                 {([
+                  { value: 'home' as const, label: 'ホーム' },
                   { value: 'explorer' as const, label: 'エクスプローラー' },
                   { value: 'agent' as const, label: 'エージェント' },
                   { value: 'history' as const, label: '履歴' },

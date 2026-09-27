@@ -1,8 +1,25 @@
-import { useEffect, useState, useRef, useCallback, type MouseEvent as ReactMouseEvent } from 'react';
-import { MockFileSystemService } from './services/MockFileSystemService';
+import { useEffect, useState, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
 import { GatewayFileSystemService } from './services/GatewayFileSystemService';
+import { LocalFileSystemService } from './services/LocalFileSystemService';
 import { FileSystemService } from './services/FileSystemService';
 import { resolveConfig } from './services/ConnectionConfig';
+import {
+  FileSystemMode,
+  HOME_SCREEN,
+  createFileSystemService,
+  createInitializedGatewayService,
+  defaultConfiguredMode,
+  resolveExplorerBackTarget,
+} from './services/FileSystemSelection';
+import { CopyPlanItem, copyFiles, planItemsCopy } from './services/FileSystemCopy';
+import {
+  COPY_TO_DEVICE_LABEL,
+  COPY_TO_PC_LABEL,
+  CopyDirection,
+  DIRECTION_UI,
+  isCopyToDeviceDisabled,
+  withCopyIndicator,
+} from './services/CopyToDeviceUi';
 import { FileSystemItem, ScreenType, AgentContext } from './domain/types';
 import { Navbar } from './components/Navbar';
 import { FileTable } from './components/FileTable';
@@ -10,15 +27,20 @@ import { FileViewer, type FileViewerHandle } from './components/FileViewer';
 import { HistoryPage } from './components/HistoryPage';
 import { AgentScreen } from './components/AgentScreen';
 import { SettingsModal } from './components/SettingsModal';
+import { HomeScreen } from './components/HomeScreen';
 import { RenameDialog } from './components/RenameDialog';
 import { CreateFolderDialog } from './components/CreateFolderDialog';
 import { DeleteConfirmDialog } from './components/DeleteConfirmDialog';
+import { CopyToDeviceDialog } from './components/CopyToDeviceDialog';
+import { CopyInProgressIndicator } from './components/CopyInProgressIndicator';
 import { UploadDialog } from './components/UploadDialog';
 import { ContextActionMenu, ContextActionMenuItem } from './components/ContextActionMenu';
 import { MoveCopyBar, MoveCopyMode } from './components/MoveCopyBar';
 import { Toast } from './components/Toast';
 import { G2RuntimeManager, G2RuntimeState } from './hud/g2-runtime';
-import { addToHistory } from './services/ViewerHistoryStore';
+import { createGatewayHistoryAccess } from './services/ViewerHistoryStore';
+import { createLocalHistoryAccess } from './services/LocalHistoryStore';
+import type { HistoryAccess } from './services/HistoryAccess';
 import './App.css';
 
 type PaneType = 'explorer' | 'agent';
@@ -26,16 +48,12 @@ type PaneOrder = [PaneType, PaneType];
 
 
 
-function createFileService(): FileSystemService {
-  const config = resolveConfig();
-  if (config.mode === 'gateway' && config.gatewayToken) {
-    return new GatewayFileSystemService(config.gatewayUrl, config.gatewayToken);
-  }
-  return new MockFileSystemService();
-}
-
 function isGatewayService(s: FileSystemService): s is GatewayFileSystemService {
   return s instanceof GatewayFileSystemService;
+}
+
+function isLocalService(s: FileSystemService): s is LocalFileSystemService {
+  return s instanceof LocalFileSystemService;
 }
 
 function pickUniqueTextFileName(existingNames: Set<string>): string {
@@ -60,7 +78,19 @@ function isPathWithinFolder(folderPath: string, targetPath: string): boolean {
 }
 
 export function App() {
-  const [fileService, setFileService] = useState<FileSystemService>(() => createFileService());
+  // Placeholder service while the Home screen is shown (never used there).
+  const [fileService, setFileService] = useState<FileSystemService>(() => createFileSystemService('mock'));
+
+  // Selected file system: null while the Home screen is showing.
+  const [fileSystemMode, setFileSystemMode] = useState<FileSystemMode | null>(null);
+  const [homeError, setHomeError] = useState<string | null>(null);
+  const [isConnecting, setIsConnecting] = useState<boolean>(false);
+
+  const historyAccess = useMemo<HistoryAccess | null>(() => {
+    if (isGatewayService(fileService)) return createGatewayHistoryAccess(fileService);
+    if (fileService instanceof LocalFileSystemService) return createLocalHistoryAccess(fileService);
+    return null;
+  }, [fileService]);
 
   // G2 Runtime Manager (created once, manages lifecycle of all G2 resources)
   const [g2Runtime] = useState(() => new G2RuntimeManager(
@@ -69,9 +99,7 @@ export function App() {
   ));
 
   // Explorer state
-  const [explorerPath, setExplorerPath] = useState<string>(() =>
-    isGatewayService(fileService) ? '' : '/home'
-  );
+  const [explorerPath, setExplorerPath] = useState<string>('');
   const [items, setItems] = useState<FileSystemItem[]>([]);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
   const [selectedFile, setSelectedFile] = useState<FileSystemItem | null>(null);
@@ -107,6 +135,11 @@ export function App() {
   // Upload dialog state
   const [showUploadDialog, setShowUploadDialog] = useState<boolean>(false);
 
+  // Cross file system copy state: `copyDirection` tracks which wording the
+  // in-progress indicator shows. `isCopying` is true while a copy is running.
+  const [copyDirection, setCopyDirection] = useState<CopyDirection>('to-device');
+  const [isCopying, setIsCopying] = useState<boolean>(false);
+
   // Move/Copy picker state (sources are snapshotted when the mode starts)
   const [moveCopySession, setMoveCopySession] = useState<{
     mode: MoveCopyMode;
@@ -125,7 +158,7 @@ export function App() {
   const [sortMode, setSortMode] = useState<'default' | 'modified'>('default');
 
   // Screen state
-  const [currentScreen, setCurrentScreen] = useState<ScreenType>('explorer');
+  const [currentScreen, setCurrentScreen] = useState<ScreenType>(HOME_SCREEN);
 
   // UI state
   const [_g2Status, setG2Status] = useState<string>('Ready');
@@ -161,12 +194,7 @@ export function App() {
   const prevIsDesktopRef = useRef<boolean>(window.innerWidth >= 1100);
   const [returnPage, setReturnPage] = useState<ScreenType>('explorer');
 
-  const getRootPath = () => {
-    if (isGatewayService(fileService)) {
-      return (fileService as GatewayFileSystemService).getRootPath();
-    }
-    return '/home';
-  };
+  const getRootPath = () => fileService.getRootPath();
 
   // Compute agent display path from live Explorer state (not from agentContext snapshot)
   const getAgentDisplayPath = (): string => {
@@ -196,9 +224,11 @@ export function App() {
     if (currentScreen === 'history') {
       return true;
     }
-    // Explorer: can go back if not at root
-    const parentPath = fileService.getParentPath(explorerPath);
-    return parentPath !== explorerPath;
+    // Home has no back target; Explorer goes to parent or, at root, to Home.
+    if (currentScreen === HOME_SCREEN) {
+      return false;
+    }
+    return true;
   };
 
   // Leaving the File Viewer discards edit mode / dirty flag.
@@ -223,8 +253,69 @@ export function App() {
     return true;
   };
 
+  // ── Home / File system selection ───────────────────────────
+
+  const handleGoHome = () => {
+    if (!confirmDiscardFileEdits('編集した内容が失われます。本当にホームへ戻りますか？')) {
+      return;
+    }
+    setMoveCopySession(null);
+    setSelectedPaths(new Set());
+    setSelectedFile(null);
+    setHighlightPath(null);
+    setHomeError(null);
+    setCurrentScreen(HOME_SCREEN);
+  };
+
+  const enterFileSystem = useCallback(
+    async (mode: FileSystemMode) => {
+      if (isConnecting) return;
+      const wasOnHome = currentScreen === HOME_SCREEN;
+      setIsConnecting(true);
+      setHomeError(null);
+
+      const service = createFileSystemService(mode);
+      try {
+        if (service instanceof GatewayFileSystemService) {
+          await service.initialize();
+          if (!service.isAvailable) {
+            throw new Error('自宅PC（Gateway）に接続できませんでした。');
+          }
+        }
+
+        const rootPath = service.getRootPath();
+        if (!rootPath) {
+          throw new Error('ルートパスを取得できませんでした。');
+        }
+        const loadedItems = await service.getDirectory(rootPath, sortMode);
+
+        setFileService(service);
+        setFileSystemMode(mode);
+        setExplorerPath(rootPath);
+        setItems(loadedItems);
+        setSelectedFile(null);
+        setSelectedPaths(new Set());
+        setHighlightPath(null);
+        setMoveCopySession(null);
+        setIsExplorerReady(true);
+        setCurrentScreen('explorer');
+      } catch (e: any) {
+        const message = e?.message || 'ファイルシステムを開けませんでした。';
+        if (wasOnHome) {
+          setHomeError(message);
+        } else {
+          alert(message);
+        }
+      } finally {
+        setIsConnecting(false);
+      }
+    },
+    [currentScreen, isConnecting, sortMode],
+  );
+
   // ── PWA Initialization ────────────────────────────────────
-  // Probe for G2 bridge on startup (does NOT start G2 Runtime)
+  // Probe for G2 bridge on startup (does NOT start G2 Runtime).
+  // The file system itself is selected on the Home screen.
   useEffect(() => {
     if (isInitializedRef.current) return;
     isInitializedRef.current = true;
@@ -233,30 +324,10 @@ export function App() {
       // Probe for bridge availability (G2-capable environment detection)
       const hasBridge = await g2Runtime.probeBridge();
       setIsBridgeAvailable(hasBridge);
-
-      // Initialize PWA file service (independent of G2)
-      if (isGatewayService(fileService)) {
-        await (fileService as GatewayFileSystemService).initialize();
-      }
-
-      const rootPath = getRootPath();
-      setExplorerPath(rootPath);
-
-      // Load root directory for Gateway service
-      if (isGatewayService(fileService)) {
-        try {
-          const loadedItems = await (fileService as GatewayFileSystemService).getDirectory(rootPath, sortMode);
-          setItems(loadedItems);
-          setIsExplorerReady(true);
-        } catch {
-          setItems([]);
-          setIsExplorerReady(false);
-        }
-      }
     };
 
     init();
-  }, [fileService, g2Runtime]);
+  }, [g2Runtime]);
 
   // ── Return Highlight Scroll ─────────────────────────────
   useEffect(() => {
@@ -294,9 +365,7 @@ export function App() {
   // Internal navigate (no history management)
   const navigateToPath = async (path: string) => {
     const newService = fileService;
-    const rootPath = isGatewayService(newService)
-      ? (newService as GatewayFileSystemService).getRootPath()
-      : '/home';
+    const rootPath = newService.getRootPath();
     const resolvedPath = path || rootPath;
 
     setExplorerPath(resolvedPath);
@@ -322,9 +391,7 @@ export function App() {
       setReturnPage(source || 'explorer');
       setCurrentScreen('file_viewer');
       // Add to history
-      if (isGatewayService(fileService)) {
-        addToHistory(fileService as GatewayFileSystemService, file.path);
-      }
+      historyAccess?.addToHistory(file.path);
     } catch (e: any) {
       alert(`Failed to open file: ${e.message}`);
     }
@@ -349,9 +416,11 @@ export function App() {
       setReturnPage(historyReturnPageRef.current);
       setCurrentScreen(historyReturnScreenRef.current);
     } else {
-      // Explorer: navigate to parent
-      const parentPath = fileService.getParentPath(explorerPath);
-      if (parentPath !== explorerPath) {
+      // Explorer: at the file system root go back to Home, otherwise to the parent.
+      if (resolveExplorerBackTarget(fileService, explorerPath) === 'home') {
+        handleGoHome();
+      } else {
+        const parentPath = fileService.getParentPath(explorerPath);
         setHighlightPath(explorerPath);
         await navigateToPath(parentPath);
       }
@@ -404,6 +473,14 @@ export function App() {
   const selectedItems = items.filter((i) => selectedPaths.has(i.path));
   const hasSelectedFolders = selectedItems.some((i) => i.type === 'directory');
 
+  // 「アプリへコピー」(PC → this device) is only offered while browsing the home PC.
+  const canCopyToThisDevice = isGatewayService(fileService);
+
+  // 「自宅PCへコピー」(this device → PC) is the mirror image: only while
+  // browsing this device, and only when a gateway connection is configured.
+  const canCopyToPc =
+    fileService instanceof LocalFileSystemService && resolveConfig().mode === 'gateway';
+
   const actionMenuItems: ContextActionMenuItem[] = currentScreen === 'file_viewer' && selectedFile
     ? (fileEditing
         ? [
@@ -451,6 +528,28 @@ export function App() {
                 handleDownloadForPaths([selectedFile.path], selectedFile.name);
               },
             },
+            ...(canCopyToThisDevice
+              ? [
+                  {
+                    label: COPY_TO_DEVICE_LABEL,
+                    disabled: isCopying,
+                    onClick: () => {
+                      handleCopyToThisDeviceFromViewer();
+                    },
+                  },
+                ]
+              : []),
+            ...(canCopyToPc
+              ? [
+                  {
+                    label: COPY_TO_PC_LABEL,
+                    disabled: isCopying,
+                    onClick: () => {
+                      handleCopyToPcFromViewer();
+                    },
+                  },
+                ]
+              : []),
             {
               label: '名前を変更',
               onClick: () => {
@@ -510,6 +609,28 @@ export function App() {
             handleDownload();
           },
         },
+        ...(canCopyToThisDevice
+          ? [
+              {
+                label: COPY_TO_DEVICE_LABEL,
+                disabled: isCopyToDeviceDisabled({ isExplorerReady, selectedCount, isCopying }),
+                onClick: () => {
+                  handleCopyToThisDevice();
+                },
+              },
+            ]
+          : []),
+        ...(canCopyToPc
+          ? [
+              {
+                label: COPY_TO_PC_LABEL,
+                disabled: isCopyToDeviceDisabled({ isExplorerReady, selectedCount, isCopying }),
+                onClick: () => {
+                  handleCopyToPc();
+                },
+              },
+            ]
+          : []),
         {
           label: '名前を変更',
           disabled: !isExplorerReady || selectedCount !== 1,
@@ -752,6 +873,186 @@ export function App() {
     await handleDownloadForPaths(paths, singleName, hasDirectory);
   }, [selectedPaths, selectedItems, handleDownloadForPaths]);
 
+  // ── Cross file system copy (PC ⇄ this device) ────────────────
+
+  const runCopy = useCallback(async (
+    source: FileSystemService,
+    target: FileSystemService,
+    plan: CopyPlanItem[],
+    direction: CopyDirection,
+  ) => {
+    if (plan.length === 0) return;
+    const ui = DIRECTION_UI[direction];
+    try {
+      const results = await copyFiles(source, target, plan, { targetLabel: ui.target });
+      setToast({
+        message: ui.done,
+        detail: results.length === 1 ? results[0].targetPath : `${results.length}件`,
+      });
+    } catch (e: any) {
+      alert(`${ui.failed}: ${e?.message || e}`);
+    }
+  }, []);
+
+  // Raises the indicator with the wording of `direction` before the first
+  // await of the copy, so the user sees the copy start right away.
+  const startCopyIndicator = useCallback((direction: CopyDirection) => {
+    setCopyDirection(direction);
+    setIsCopying(true);
+  }, []);
+
+  const handleCopyToThisDevice = useCallback(async () => {
+    const paths = Array.from(selectedPaths);
+    if (paths.length === 0) return;
+
+    const ui = DIRECTION_UI['to-device'];
+
+    await withCopyIndicator(
+      () => startCopyIndicator('to-device'),
+      () => setIsCopying(false),
+      async () => {
+        const source = fileService;
+        const target = createFileSystemService('local');
+
+        let plan: CopyPlanItem[];
+        try {
+          plan = await planItemsCopy(source, target, paths, { targetLabel: ui.target });
+        } catch (e: any) {
+          alert(`${ui.failed}: ${e?.message || e}`);
+          return;
+        }
+
+        const conflict = plan.find((p) => p.existing !== 'none');
+        if (conflict) {
+          const kind = conflict.existing === 'directory' ? 'フォルダ' : 'ファイル';
+          alert(`${ui.target}に同名の${kind}があるためコピーできません: ${conflict.name}`);
+          return;
+        }
+
+        await runCopy(source, target, plan, 'to-device');
+      },
+    );
+  }, [selectedPaths, fileService, runCopy, startCopyIndicator]);
+
+  const handleCopyToPc = useCallback(async () => {
+    const paths = Array.from(selectedPaths);
+    if (paths.length === 0) return;
+
+    const ui = DIRECTION_UI['to-pc'];
+
+    await withCopyIndicator(
+      () => startCopyIndicator('to-pc'),
+      () => setIsCopying(false),
+      async () => {
+        const source = fileService;
+
+        // The gateway reports an empty root path until `initialize()` has
+        // finished, so the connection is opened before anything is planned.
+        let target: FileSystemService;
+        try {
+          target = await createInitializedGatewayService();
+        } catch (e: any) {
+          alert(`${ui.failed}: ${e?.message || e}`);
+          return;
+        }
+
+        let plan: CopyPlanItem[];
+        try {
+          plan = await planItemsCopy(source, target, paths, { targetLabel: ui.target });
+        } catch (e: any) {
+          alert(`${ui.failed}: ${e?.message || e}`);
+          return;
+        }
+
+        const conflict = plan.find((p) => p.existing !== 'none');
+        if (conflict) {
+          const kind = conflict.existing === 'directory' ? 'フォルダ' : 'ファイル';
+          alert(`${ui.target}に同名の${kind}があるためコピーできません: ${conflict.name}`);
+          return;
+        }
+
+        await runCopy(source, target, plan, 'to-pc');
+      },
+    );
+  }, [selectedPaths, fileService, runCopy, startCopyIndicator]);
+
+  // ── FileViewer copy handlers (single file from viewer) ────────
+
+  const handleCopyToThisDeviceFromViewer = useCallback(async () => {
+    if (!selectedFile) return;
+
+    const ui = DIRECTION_UI['to-device'];
+
+    await withCopyIndicator(
+      () => startCopyIndicator('to-device'),
+      () => setIsCopying(false),
+      async () => {
+        const source = fileService;
+        const target = createFileSystemService('local');
+
+        let plan: CopyPlanItem[];
+        try {
+          plan = await planItemsCopy(source, target, [selectedFile.path], { targetLabel: ui.target });
+        } catch (e: any) {
+          alert(`${ui.failed}: ${e?.message || e}`);
+          return;
+        }
+
+        const conflict = plan.find((p) => p.existing !== 'none');
+        if (conflict) {
+          const kind = conflict.existing === 'directory' ? 'フォルダ' : 'ファイル';
+          alert(`${ui.target}に同名の${kind}があるためコピーできません: ${conflict.name}`);
+          return;
+        }
+
+        await runCopy(source, target, plan, 'to-device');
+      },
+    );
+  }, [selectedFile, fileService, runCopy, startCopyIndicator]);
+
+  const handleCopyToPcFromViewer = useCallback(async () => {
+    if (!selectedFile) return;
+
+    const ui = DIRECTION_UI['to-pc'];
+
+    await withCopyIndicator(
+      () => startCopyIndicator('to-pc'),
+      () => setIsCopying(false),
+      async () => {
+        const source = fileService;
+
+        // The gateway reports an empty root path until `initialize()` has
+        // finished, so the connection is opened before anything is planned.
+        let target: FileSystemService;
+        try {
+          target = await createInitializedGatewayService();
+        } catch (e: any) {
+          alert(`${ui.failed}: ${e?.message || e}`);
+          return;
+        }
+
+        let plan: CopyPlanItem[];
+        try {
+          plan = await planItemsCopy(source, target, [selectedFile.path], { targetLabel: ui.target });
+        } catch (e: any) {
+          alert(`${ui.failed}: ${e?.message || e}`);
+          return;
+        }
+
+        const conflict = plan.find((p) => p.existing !== 'none');
+        if (conflict) {
+          const kind = conflict.existing === 'directory' ? 'フォルダ' : 'ファイル';
+          alert(`${ui.target}に同名の${kind}があるためコピーできません: ${conflict.name}`);
+          return;
+        }
+
+        await runCopy(source, target, plan, 'to-pc');
+      },
+    );
+  }, [selectedFile, fileService, runCopy, startCopyIndicator]);
+
+
+
   // ── Move / Copy ─────────────────────────────────────────────
 
   // Active source folders: themselves and their subtrees are invalid destinations.
@@ -857,23 +1158,8 @@ export function App() {
     if (edited === null || edited === undefined) return;
 
     try {
-      const parentPath = fileService.getParentPath(selectedFile.path);
       const fileName = selectedFile.path.split(/[\/\\]/).pop() || selectedFile.name;
-      const file = new File([edited], fileName, { type: 'text/plain;charset=utf-8' });
-      // Reuse the existing upload pipeline with overwrite enabled.
-      const result = await fileService.uploadItems(
-        parentPath,
-        [{ file, relativePath: fileName }],
-        undefined,
-        undefined,
-        { overwrite: true },
-      );
-      if (result.errors && result.errors.length > 0) {
-        throw new Error(result.errors[0].error || '書き込みエラー');
-      }
-      if (result.uploaded < 1) {
-        throw new Error('ファイルが書き込まれませんでした');
-      }
+      await fileService.writeFile(selectedFile.path, edited);
       // Reflect the saved content immediately, then leave edit mode.
       setFileContent(edited);
       setFileEditing(false);
@@ -980,15 +1266,17 @@ export function App() {
         return Math.max(MIN_PANE_WIDTH, Math.min(maxExplorer, prev));
       });
 
-      // Wide → Narrow: preserve Left Pane as currentScreen
+      // Wide → Narrow: preserve Left Pane as currentScreen (Home stays Home)
       if (wasDesktop && !nowDesktop) {
         setPaneOrder((order) => {
           const leftPane = order[0];
-          if (leftPane === 'explorer') {
-            setCurrentScreen((prev) => prev === 'file_viewer' ? 'file_viewer' : 'explorer');
-          } else {
-            setCurrentScreen('agent');
-          }
+          setCurrentScreen((prev) => {
+            if (prev === 'home') return 'home';
+            if (leftPane === 'explorer') {
+              return prev === 'file_viewer' ? 'file_viewer' : 'explorer';
+            }
+            return 'agent';
+          });
           return order;
         });
       }
@@ -996,6 +1284,7 @@ export function App() {
       // Narrow → Wide: set Left Pane to the screen user was viewing
       if (!wasDesktop && nowDesktop) {
         setCurrentScreen((prevScreen) => {
+          if (prevScreen === 'home') return prevScreen;
           setPaneOrder((order) => {
             const currentLeft = order[0];
             const effectiveScreen = prevScreen === 'file_viewer' ? 'explorer' : prevScreen;
@@ -1012,33 +1301,10 @@ export function App() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
+  // Connection settings changed (QR/paste/clear) → re-enter using the configuration.
   const handleReconnect = useCallback(async () => {
-    const newService = createFileService();
-    setFileService(newService);
-
-    if (isGatewayService(newService)) {
-      await (newService as GatewayFileSystemService).initialize();
-    }
-
-    const rootPath = isGatewayService(newService)
-      ? (newService as GatewayFileSystemService).getRootPath()
-      : '/home';
-    setExplorerPath(rootPath);
-    setCurrentScreen('explorer');
-    setSelectedFile(null);
-    setSelectedPaths(new Set());
-
-    // Load initial directory for PWA display
-    try {
-      const loadedItems = await newService.getDirectory(rootPath, sortMode);
-      setItems(loadedItems);
-      setIsExplorerReady(isGatewayService(newService));
-    } catch (e) {
-      console.error('[App] Failed to load directory after reconnect:', e);
-      setItems([]);
-      setIsExplorerReady(false);
-    }
-  }, []);
+    await enterFileSystem(defaultConfiguredMode());
+  }, [enterFileSystem]);
 
   // Determine the path to display in navbar
   const getNavbarPath = (): string => {
@@ -1068,136 +1334,13 @@ export function App() {
   // Determine which pane is first/last for swap button placement
   const isFirstExplorer = paneOrder[0] === 'explorer';
 
-  // Build Explorer pane content
-  const explorerPane = (
-    <div className={`explorer-pane ${isDesktop || currentScreen === 'explorer' || currentScreen === 'file_viewer' || currentScreen === 'history' ? '' : 'pane-hidden'}`} key="explorer-pane">
-      <Navbar
-        currentPath={getNavbarPath()}
-        mode="explorer"
-        rootPath={isGatewayService(fileService) ? getRootPath() : undefined}
-        title={currentScreen === 'file_viewer' && selectedFile ? selectedFile.name : undefined}
-        onBack={handleExplorerBack}
-        canGoBack={canExplorerGoBack()}
-        onReload={handleExplorerReload}
-        onOpenSettings={() => setShowSettings(true)}
-        onOpenAgent={handleOpenAgent}
-        showSettingsButton={isDesktop && !isFirstExplorer}
-        showSwapButton={isDesktop && !isFirstExplorer}
-        onSwapPanes={handleSwapPanes}
-        onPathBarClick={currentScreen === 'history' ? undefined : handleNavigateToHistory}
-        onOpenActionMenu={
-          currentScreen === 'explorer' || currentScreen === 'file_viewer'
-            ? handleOpenActionMenu
-            : currentScreen === 'history'
-              ? historyActionMenuHandler || undefined
-              : undefined
-        }
-      />
+  // The Agent talks to the home PC (OpenCode), so it is not offered for "アプリ".
+  const showAgentPane = fileSystemMode !== 'local';
+  const canNavigateToHistory = historyAccess !== null && currentScreen !== 'history';
 
-      <div className="main-content-container">
-        <main className="content-view">
-          {currentScreen === 'explorer' && (
-            <FileTable
-              items={items}
-              selectedPaths={selectedPaths}
-              highlightPath={highlightPath}
-              pickerMode={!!moveCopySession}
-              isPickerPathBlocked={isPickerPathBlocked}
-              onSelectItem={() => {
-                // No-op: selection is now via toggle; item click opens/navigates
-              }}
-              onOpenDirectory={handleOpenDirectory}
-              onOpenFile={handleOpenFile}
-              onToggleSelect={handleToggleSelect}
-            />
-          )}
-
-          {currentScreen === 'file_viewer' && selectedFile && (
-            <FileViewer
-              ref={fileViewerRef}
-              content={fileContent}
-              filePath={selectedFile.path}
-              gatewayService={isGatewayService(fileService) ? fileService as GatewayFileSystemService : null}
-              editing={fileEditing}
-              onDirtyChange={setFileEditDirty}
-            />
-          )}
-
-          {currentScreen === 'history' && isGatewayService(fileService) && (
-            <HistoryPage
-              gatewayService={fileService as GatewayFileSystemService}
-              onActionMenuReady={handleHistoryActionMenuReady}
-              onSelectFile={(path) => {
-                // Open file from history with source='history'
-                const fileName = path.split(/[\/\\]/).pop() || path;
-                const fileItem: FileSystemItem = {
-                  id: path,
-                  name: fileName,
-                  type: 'file',
-                  path,
-                };
-                handleOpenFile(fileItem, 0, 'history');
-              }}
-            />
-          )}
-        </main>
-      </div>
-
-      {currentScreen === 'explorer' && moveCopySession && (
-        <MoveCopyBar
-          mode={moveCopySession.mode}
-          count={moveCopySession.sources.length}
-          sourceNames={moveCopySession.sources.map((s) => s.name)}
-          destPath={explorerPath}
-          destBlocked={isPickerPathBlocked(explorerPath)}
-          isBusy={isMoveCopying}
-          onCancel={handleMoveCopyCancel}
-          onConfirm={handleMoveCopyConfirm}
-        />
-      )}
-    </div>
-  );
-
-  // Build Agent pane content
-  const agentPane = (
-    <div className={`agent-pane ${isDesktop || currentScreen === 'agent' ? '' : 'pane-hidden'}`} key="agent-pane">
-      <AgentScreen
-        currentPath={getAgentDisplayPath()}
-        gatewayUrl={resolveConfig().gatewayUrl}
-        gatewayToken={resolveConfig().gatewayToken}
-        buildLiveContext={buildLiveContext}
-        onOpenSettings={() => setShowSettings(true)}
-        onOpenExplorer={handleOpenExplorer}
-        onPathBarClick={currentScreen === 'history' ? undefined : handleNavigateToHistory}
-        showSettingsButton={isDesktop && isFirstExplorer}
-        showSwapButton={isDesktop && isFirstExplorer}
-        onSwapPanes={handleSwapPanes}
-      />
-    </div>
-  );
-
-  // Build divider (only in desktop 2-pane mode)
-  const divider = isDesktop ? (
-    <div
-      key="pane-divider"
-      className={`pane-divider ${isDragging ? 'dragging' : ''}`}
-      onPointerDown={handleDividerPointerDown}
-      onPointerMove={handleDividerPointerMove}
-      onPointerUp={handleDividerPointerUp}
-    />
-  ) : null;
-
-  return (
-    <div
-      className="app-layout"
-      style={isDesktop ? { gridTemplateColumns: `${explorerPaneWidth}px 4px 1fr` } : undefined}
-    >
-      {isFirstExplorer ? (
-        <>{explorerPane}{divider}{agentPane}</>
-      ) : (
-        <>{agentPane}{divider}{explorerPane}</>
-      )}
-
+  // Overlays shared by every screen, including Home.
+  const overlayLayer = (
+    <>
       {/* Settings Modal */}
       <SettingsModal
         isOpen={showSettings}
@@ -1253,6 +1396,14 @@ export function App() {
         currentPath={explorerPath}
         onComplete={handleUploadComplete}
         onCancel={() => setShowUploadDialog(false)}
+      />
+
+      {/* Cross file system copy — overwrite confirmation (not used: conflicts are rejected at planning stage) */}
+      <CopyToDeviceDialog
+        isOpen={false}
+        conflictingNames={[]}
+        onConfirm={() => undefined}
+        onCancel={() => undefined}
       />
 
       {/* G2 Runtime Active Modal */}
@@ -1315,6 +1466,12 @@ export function App() {
         </div>
       )}
 
+      {/* Cross file system copy — in progress */}
+      <CopyInProgressIndicator
+        isVisible={isCopying}
+        message={DIRECTION_UI[copyDirection].inProgress}
+      />
+
       {/* Toast */}
       {toast && (
         <Toast
@@ -1323,6 +1480,164 @@ export function App() {
           onDone={() => setToast(null)}
         />
       )}
+    </>
+  );
+
+  // Home: choose the file system before any Explorer state exists.
+  if (currentScreen === HOME_SCREEN) {
+    return (
+      <div className="app-layout home-layout">
+        <HomeScreen
+          onSelect={enterFileSystem}
+          onOpenSettings={() => setShowSettings(true)}
+          error={homeError}
+          isConnecting={isConnecting}
+        />
+        {overlayLayer}
+      </div>
+    );
+  }
+
+  // Build Explorer pane content
+  const explorerPane = (
+    <div className={`explorer-pane ${isDesktop || currentScreen === 'explorer' || currentScreen === 'file_viewer' || currentScreen === 'history' ? '' : 'pane-hidden'}`} key="explorer-pane">
+      <Navbar
+        currentPath={getNavbarPath()}
+        mode="explorer"
+        rootPath={getRootPath()}
+        title={currentScreen === 'file_viewer' && selectedFile ? selectedFile.name : undefined}
+        onBack={handleExplorerBack}
+        canGoBack={canExplorerGoBack()}
+        onReload={handleExplorerReload}
+        onOpenSettings={() => setShowSettings(true)}
+        onOpenAgent={showAgentPane ? handleOpenAgent : undefined}
+        showSettingsButton={isDesktop && (!isFirstExplorer || !showAgentPane)}
+        showSwapButton={isDesktop && !isFirstExplorer && showAgentPane}
+        onSwapPanes={handleSwapPanes}
+        onPathBarClick={canNavigateToHistory ? handleNavigateToHistory : undefined}
+        onOpenActionMenu={
+          currentScreen === 'explorer' || currentScreen === 'file_viewer'
+            ? handleOpenActionMenu
+            : currentScreen === 'history'
+              ? historyActionMenuHandler || undefined
+              : undefined
+        }
+      />
+
+      <div className="main-content-container">
+        <main className="content-view">
+          {currentScreen === 'explorer' && (
+            <FileTable
+              items={items}
+              selectedPaths={selectedPaths}
+              highlightPath={highlightPath}
+              pickerMode={!!moveCopySession}
+              isPickerPathBlocked={isPickerPathBlocked}
+              onSelectItem={() => {
+                // No-op: selection is now via toggle; item click opens/navigates
+              }}
+              onOpenDirectory={handleOpenDirectory}
+              onOpenFile={handleOpenFile}
+              onToggleSelect={handleToggleSelect}
+            />
+          )}
+
+          {currentScreen === 'file_viewer' && selectedFile && (
+            <FileViewer
+              ref={fileViewerRef}
+              content={fileContent}
+              filePath={selectedFile.path}
+              gatewayService={isGatewayService(fileService) ? fileService as GatewayFileSystemService : null}
+              localMode={isLocalService(fileService)}
+              editing={fileEditing}
+              onDirtyChange={setFileEditDirty}
+            />
+          )}
+
+          {currentScreen === 'history' && historyAccess && (
+            <HistoryPage
+              historyAccess={historyAccess}
+              onActionMenuReady={handleHistoryActionMenuReady}
+              onSelectFile={(path) => {
+                // Open file from history with source='history'
+                const fileName = path.split(/[\/\\]/).pop() || path;
+                const fileItem: FileSystemItem = {
+                  id: path,
+                  name: fileName,
+                  type: 'file',
+                  path,
+                };
+                handleOpenFile(fileItem, 0, 'history');
+              }}
+            />
+          )}
+        </main>
+      </div>
+
+      {currentScreen === 'explorer' && moveCopySession && (
+        <MoveCopyBar
+          mode={moveCopySession.mode}
+          count={moveCopySession.sources.length}
+          sourceNames={moveCopySession.sources.map((s) => s.name)}
+          destPath={explorerPath}
+          destBlocked={isPickerPathBlocked(explorerPath)}
+          isBusy={isMoveCopying}
+          onCancel={handleMoveCopyCancel}
+          onConfirm={handleMoveCopyConfirm}
+        />
+      )}
+    </div>
+  );
+
+  // Build Agent pane content
+  const agentPane = (
+    <div className={`agent-pane ${isDesktop || currentScreen === 'agent' ? '' : 'pane-hidden'}`} key="agent-pane">
+      <AgentScreen
+        currentPath={getAgentDisplayPath()}
+        gatewayUrl={resolveConfig().gatewayUrl}
+        gatewayToken={resolveConfig().gatewayToken}
+        buildLiveContext={buildLiveContext}
+        onOpenSettings={() => setShowSettings(true)}
+        onOpenExplorer={handleOpenExplorer}
+        onPathBarClick={canNavigateToHistory ? handleNavigateToHistory : undefined}
+        showSettingsButton={isDesktop && isFirstExplorer}
+        showSwapButton={isDesktop && isFirstExplorer}
+        onSwapPanes={handleSwapPanes}
+      />
+    </div>
+  );
+
+  // Build divider (only in desktop 2-pane mode)
+  const divider = isDesktop && showAgentPane ? (
+    <div
+      key="pane-divider"
+      className={`pane-divider ${isDragging ? 'dragging' : ''}`}
+      onPointerDown={handleDividerPointerDown}
+      onPointerMove={handleDividerPointerMove}
+      onPointerUp={handleDividerPointerUp}
+    />
+  ) : null;
+
+  return (
+    <div
+      className="app-layout"
+      style={
+        !isDesktop
+          ? undefined
+          : showAgentPane
+            ? { gridTemplateColumns: `${explorerPaneWidth}px 4px 1fr` }
+            : { gridTemplateColumns: '1fr', gridTemplateRows: '1fr' }
+      }
+    >
+      {!showAgentPane ? (
+        explorerPane
+      ) : isFirstExplorer ? (
+        <>{explorerPane}{divider}{agentPane}</>
+      ) : (
+        <>{agentPane}{divider}{explorerPane}</>
+      )}
+
+      {overlayLayer}
     </div>
   );
 }
