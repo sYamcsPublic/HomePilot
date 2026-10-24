@@ -1934,6 +1934,13 @@ HomePilotは個人利用を前提とした実験的なシステムであるた�
 - [`SETUP.md`](SETUP.md) — 環境構築・起動・動作確認・デプロイ
 - [`DEVELOPMENT.md`](DEVELOPMENT.md) — 開発経緯・設計判断・AI支援開発の方法
 
+## Related Projects / 関連プロジェクト
+
+HomePilot以外にも、Webアプリ開発や動作検証を支援するツールを個人開発しています。
+
+- [sYamcs Portfolio](https://github.com/sYamcsPublic/Portfolio) — 個人開発プロジェクトと技術活動の一覧
+- [Pekemalu Works（BOOTH）](https://pekemalu.booth.pm/) — Webアプリ開発・テストなどに役立つ開発支援ツール
+
 ## License
 
 HomePilot is licensed under the MIT License.
